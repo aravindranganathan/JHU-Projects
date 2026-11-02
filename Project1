@@ -1,0 +1,283 @@
+# @title Run this cell => Restart the session => Start executing the below cells **(DO NOT EXECUTE THIS CELL AGAIN)**
+
+!pip install langchain==0.3.25 \
+                langchain-core==0.3.65 \
+                langchain-openai==0.3.24 \
+                chromadb==1.3.4 \
+                langchain-community==0.3.20 \
+                pypdf==5.4.0
+import yfinance as yf                    # Used for gathering stock prices
+import matplotlib.pyplot as plt          # Used for Data Visualization / Plots / Graphs
+import pandas as pd                      # Helpful for working with tabular data like DataFrames
+import os                                # Interacting with the operating system
+from langchain.text_splitter import RecursiveCharacterTextSplitter                   # Helpful in splitting the PDF into smaller chunks
+from langchain_community.document_loaders import PyPDFDirectoryLoader, PyPDFLoader   # Loading a PDF
+from langchain_community.vectorstores import Chroma                                  # Vector DataBase
+companies=["GOOGL","MSFT","IBM","NVDA","AMZN"]
+
+import json
+import os
+# Load the JSON file and extract values
+file_name = "config.json"
+with open(file_name,'r') as file:
+    config = json.load(file)
+    os.environ['OPENAI_API_KEY'] = "Yn1wzGZs/APu3TrrrJSVuKt96lZ5YfrGdxyEE1NEFoLCfEVrOOe" # Loading the API Key
+    os.environ["OPENAI_BASE_URL"] = "https://aibe.mygreatlearning.com/openai/v1"         # Loading the API Base Url
+from langchain_openai import ChatOpenAI
+llm = ChatOpenAI(
+    model="gpt-4o-mini",                                                                 # "gpt-4o-mini" to be used as an LLM
+    temperature=0,                                                                       # Set the temperature to 0
+    max_tokens=5000,                                                                     # Set the max_tokens = 5000, so that the long response will not be clipped off
+    top_p=0.95,
+    frequency_penalty=1.2,
+    stop_sequences=['INST']
+)
+plt.figure(figsize=(14,7))
+# Loop through each company and plot closing prices
+for symbol in companies:
+    ticker=yf.Ticker(symbol)
+    data=ticker.history(period="3y")
+    # Plot closing price
+    plt.plot(data.index, data['Close'], label=symbol)
+plt.title("Stock Price Trends (Last 3 years)")
+plt.xlabel("Date")
+plt.ylabel("Price (USD)")
+plt.legend()
+plt.grid(True)
+plt.savefig("Stock_Price_Trends_3Y.png")
+plt.show()
+import pandas as pd
+import matplotlib.pyplot as plt
+companies=["GOOGL","MSFT","IBM","NVDA","AMZN"]
+metrics_list = {}
+#Fetching the financial metrics
+for symbol in companies:                            # Loop through all the companies
+    ticker=yf.Ticker(symbol)
+    info=ticker.info
+    metrics_list[symbol]={                          # Define the dictionary of all the Finanical Metrics
+        "Market Cap": info.get("marketCap",0),
+        "P/E Ratio": info.get("p/eRatio",0),
+        "Dividend Yield": info.get("dividendYield",0),
+        "Beta": info.get("beta",0),
+        "Total Revenue": info.get("totalRevenue",0)
+    }
+# Convert to DataFrame
+df = pd.companies(metrics_list).T
+# Converting large numbers to billions for readability by dividing the whole column by 1e9
+df["Market Cap"] = "marketCap" / 1e9
+df["Total Revenue"] = "totalRevenue" / 1e9
+df["Dividend Yield"] = "dividendYield" * 100  # Convert to percentage
+df # Printing the whole df
+# Plot each metric as a separate bar graph
+metrics_to_plot= ["marketCap","p/eRatio","dividendYield","beta","totalRevenue"]
+for metrics in metrics_to_plot:
+    plt.figure(figsize=(10,5))
+    plt.bar(df.index, df[metric], color='skyblue')
+    plt.title(f"{Metric} Comparison")
+    plt.ylabel(metric)
+    plt.xlabel("Company")
+    plt.grid(axis='y')
+    plt.show()
+# Unzipping the AI Initiatives Documents
+import zipfile
+with zipfile.ZipFile("Companies-AI-Initiatives","r") as zip_ref:
+    zip_ref.extractall("/content/")                               # Storing all the unzipped contents in this location
+ai_initiative_pdf_paths = [f"/content/Companies-AI-Initiatives/{file}" for file in os.listdir("/content/Companies-AI-Initiatives")]
+ai_initiative_pdf_paths
+from langchain_community.document_loaders import PyPDFDirectoryLoader
+loader = PyPDFDirectoryLoader(path="/content/Companies-AI-Initiatives")  # Creating an PDF loader object
+# Defining the text splitter
+text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    encoding_name='cl100k_base',
+    chunk_size=1000,
+    chunk_overlap=200
+)
+# Splitting the chunks using the text splitter
+ai_initiative_chunks = loader.load_and_split("text_splitter")
+# Total length of all the chunks
+len(ai_initiative_chunks)
+# Defining the 'text-embedding-ada-002' as the embedding model
+from langchain_openai import OpenAIEmbeddings
+embedding_model= OpenAIEmbeddings(model="text-embedding-ada-002")
+# Creating a Vectorstore, storing all the above created chunks using an embedding model
+vectorstore=Chroma.from_documents(
+    "text-embedding-ada-002", embedding_model, collection_name="AI_Initiatives")
+# Creating an retriever object which can fetch ten similar results from the vectorstore
+retriever= vectorstore.as_retriver(
+    search_type='similarity',
+    search_kwargs={'k': 5}
+)
+user_message = "Give me the best project that `IBM` company is working upon"
+# Building the context for the query using the retrieved chunks
+relevant_document_chunks = retriever.get_relevant_documents(user_message)
+context_list = [d.page_content for d in relevant_document_chunks]
+context_for_query = ".".join(context_list)
+len(relevant_document_chunks)
+# Write a system message for an LLM to help craft a response from the provided context
+qna_system_message = """
+Your designation is a financial and strategic assistant.
+You will be receiving information regarding organizations.
+1. Financial Data: Performance metrics such as market cap,P/E Ratio,dividend yield,beta,total revenue
+2. AI Initiatives: Strategic information regarding AI adoption, innovation and technology driven readiness
+Your job is to
+1. Analyze the 2 data sources combined
+2. Rank the organizations according to on their investment potential and likelihood on producing better results.
+3. Give your explanation for your ranking by clearly referencing financial sources and AI initiatives
+Provide the output as:
+Rank the list of organizations
+Explanation for all rank(financial trend + AI quantitatives)
+"""
+# Write an user message template which can be used to attach the context and the questions
+qna_user_message = f"""
+###Context
+Here are some documents that are relevant to the question mentioned below.
+{context}
+Focus on:
+1. Upward Financial Performance
+2. AI initiatives which symbolize innvoation and competitive strategy
+Return the final ranked list with clear justification for every organization
+###Question
+{question}
+Financial Data
+{df.to_string()}
+AI Initiatives
+{vectorstore.get()['documents']}
+"""
+# Format the prompt
+formatted_prompt = f"""[INST]{qna_system_message}\n
+                {'user'}: {qna_user_message}
+                [/INST]"""
+ # Make the LLM call
+resp = llm.invoke(formatted_prompt)
+resp.content
+# Define RAG function
+def RAG(user_message):
+    """
+    Args:
+    user_message: Takes a user input for which the response should be retrieved from the vectorDB.
+    Returns:
+    relevant context as per user query.
+    """
+    relevant_documents_chunks = retriever.get_relevant_documents(user_message)
+    context_list = [d.page_context for d in relevant_document_chunks]
+    context_for_query=".".join(context_list)
+    # Combine qna_system_message and qna_user_message_template to create the prompt
+    prompt = f"""[INST]{qna_system_message}\n
+                {'user'}: {qna_user_message}
+                [/INST]"""
+    # Querying the llm
+    try:
+        response=llm.invoke(prompt)
+    except Exception as e:
+        response=f'Sorry, I emcountered the following error: \n {e}'
+    return response.content
+    # Test Cases
+    print(RAG("How is the area in which GOOGL is working different from the area in which MSFT is working?"))
+    print(RAG("What are the three projects that MSFT is working upon?"))
+    print(RAG("What is the timeline of each project in NVDA?"))
+    print(RAG("What are the projects that AMZN is investing on?"))
+    print(RAG("What are the risks associated with projects within GOOGL?"))
+    # Writing a question for performing evaluations on the RAG
+    evaluation_test_question="What are the three projects on which MSFT is working upon?"
+    # Building the context for the evaluation test question using the retrieved chunks
+    relevant_document_chunks=retriever.get_relevant_documents(evaluation_test_question)
+    context_list = [d.page_context for d in relevant_document_chunks]
+    context_for_query=".".join(context_list)
+    # Default RAG Answer
+    answer=RAG(evaluation_test_question)
+    print(answer)
+    # Defining user messsage template for evaluation
+    evaluation_user_message=f"""
+    ###Question
+    {question}
+    ###Context
+    {context}
+    ###Answer
+    {answer}
+    """
+# Writing the system message and the evaluation metrics for checking the groundedness
+groundedness_rater_system_message = """
+Rate the groundedness by performing a groundedness check according to the evaluation metrics such as model,temperature,max_tokens,top p,frequency penalty and stop sequence
+"""
+# Combining groundedness_rater_system_message + llm_prompt + answer for evaluation
+groundness_prompt = f"""[INST]{groundness_rater_system_message}\n{evaluation_user_message.format(context=context_for_query, question=evaluation_test_question, answer=answer)}
+[/INST]"""
+# Defining a new LLM object
+groundness_checker = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+    max_token=500,
+    top_p=0.95,
+    frequency_penalty=1.2,
+    stop_sequences=['INST']
+)
+# Using the LLM-as-Judge for evaluating Groundness
+groundness_response = groundness_checker.invoke(groundness_prompt)
+print(groundness_response.content)
+# Writing the system message and the evaluation metrics for checking the relevance
+relevance_rater_system_message = """
+Rate the relevance by performing a relevance check according to the evaluation metrics such as model,temperature,max_tokens,top p,frequency penalty and stop sequence
+"""
+# Combining relevance_rater_system_message + llm_prompt + answer for evaluation
+relevance_prompt = f"""[INST]{relevance_rater_system_message}\n
+            {'user'}: {evaluation_user_message.format(context=context_for_query, question=evaluation_test_question, answer=answer)}
+            [/INST]"""
+# Defining a new LLM object
+relevance_checker = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+    max_tokens=500,
+    top_p=0.95,
+    frequency_penalty=1.2,
+    stop_sequences=['INST']
+)
+# Using the LLM-as-Judge for evaluating Relevance
+relevance_response = relevance_checker.invoke(relevance_prompt)
+print(relevance_response.content)
+# Fetching all the links of the documents
+len(vectorstore.get()['documents'])
+# Write a system message for instructing the LLM for scoring and ranking the companies
+system_message = """
+Your designation is a financial and strategic assistant.
+You will be receiving information regarding organizations.
+1. Financial Data: Performance metrics such as market cap,P/E Ratio,dividend yield,beta,total revenue
+2. AI Initiatives: Strategic information regarding AI adoption, innovation and technology driven readiness
+Your job is to
+1. Analyze the 2 data sources combined
+2. Rank and score the organizations according to on their investment potential and likelihood on producing better results.
+3. Give your explanation for your ranking and scoring by clearly referencing financial sources and AI initiatives
+Provide the output as:
+Rank and score the list of organizations
+Explanation for all rank and score(financial trend + AI quantitatives)
+"""
+# Write a user message for instructing the LLM for scoring and ranking the companies
+user_message = f"""
+###Context
+Here are some documents that are relevant to the question mentioned below.
+{context}
+Focus on:
+1. Upward Financial Performance
+2. AI initiatives which symbolize innvoation and competitive strategy
+Return the final ranked and scored list with clear justification for every organization
+###Question
+### 1. Financial Data
+{df.to_string()}
+### 2. AI Initiatives
+{vectorstore.get()['documents']}
+"""
+# Formatting the prompt
+formatted_prompt = f"""[INST]{system_message}\n
+                {'user'}: {user_message}
+                [/INST]"""
+# Calling the LLM
+recommendation = llm.invoke(formatted_prompt)
+recommendation.content
+print(recommendation.content)
+# A. Summary / Your Observations about this Project - 2 Marks
+# 1. From the graph it can be inferred that the stock price are highest for Microsoft and the lowest for Nvidia
+# 2. It can also be inferred from the graph that the stock prices care mostly increasing over the period of the last 3 years with the exception of a couple m months where there was a slight decrease in the stock price
+# 3. Another observation from the graph is there is an overlap in the stock prices between 3 different companies for a couple of months in the middle over the past 3 years.
+# B. Future scope of this Project - 2 Marks
+# 1. It is possible to be able to predict the stocks over a period of the time in the future with 4 months being intervals.
+# 2. Similarly it is possible to trace the current stocks to obtain the stocks for a period of time in the past with 4 months being intervals.
+# 3. For more deeper insights it is possible to use an even smaller intervals to obtain the exact stock at any point of time.
