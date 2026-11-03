@@ -1,0 +1,1672 @@
+!pip install \
+  langchain==0.3.27 \
+  langchain-core==0.3.79 \
+  langchain-openai==0.3.11 \
+  langchain-community==0.3.31 \
+  langgraph==0.3.7 \
+  tavily-python \
+  yfinance==0.2.66 \
+  chromadb==1.3.4 \
+  pypdf==6.2.0 \
+  tiktoken==0.12.0
+
+print("✅ All packages installed successfully!")
+
+# Core imports
+import os
+import sys
+import json
+import logging
+from typing import Dict, List, Literal
+from datetime import datetime
+
+# LangChain imports
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import ToolNode
+from langgraph.graph.message import add_messages
+from typing import Annotated, Sequence, TypedDict
+
+# External tools
+import yfinance as yf
+
+# Configure logging to see agent
+logging.basicConfig(
+    level=logging. INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s' ,
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+print("✅ All imports successful!")
+
+import json
+# Load the JSON file and extract values
+file_name = 'config.json'
+with open(file_name, 'r') as file:
+    config = json.load(file)
+
+os.environ["OPENAI_API_KEY"] = config.get("API_KEY")
+os.environ["OPENAI_API_BASE"] = config.get("OPENAI_API_BASE")
+os.environ["TAVILY_API_KEY"] = config.get("TAVILY_API_KEY")
+
+print("✅ Configuration loaded successfully!")
+print(f" Using API base: {os.environ["OPENAI_API_BASE"]}" )
+
+TRADITIONAL_PROMPT="""You are a helpful assistant. Answer the user's question about stock information."""
+
+print("📋 Traditional LLM Prompt:")
+print("="*80)
+print(TRADITIONAL_PROMPT)
+print("="*80)
+print("\n❌ Problems with this approach:")
+print("   • No initiative - waits for user to specify what they want")
+print("   • No comprehensive analysis - just answers the question")
+print("   • Asks follow-up questions instead of taking action")
+print("   • Provides minimal information")
+
+AGENT_CHARTER_BASIC="""You are an autonomuous Financial Research Analyst specializing in AI-focussed companies
+
+YOUR PRIMARY GOAL:
+Generate a comprehensive financial analysis report for the requested company that includes:
+1. Current stock price and 3 year performance trend
+2. Recent financial news and market sentiment
+3. Key risks and opportunities
+4. Investment recommendation with supporting evidence
+
+Take the initiative to gather all the information to achieve this goal.
+Don't just answer the questions - proactively provide complete, actionable insights.
+"""
+
+print("📋 Agent Charter (Goal-Oriented):")
+print("="*80)
+print(AGENT_CHARTER_BASIC)
+print("="*80)
+print("\n✅ Benefits of this approach:")
+print("   • Defines a clear mission and goal")
+print("   • Specifies expected output format")
+print("   • Encourages proactive information gathering")
+print("   • Focuses on actionable insights, not just answers")
+
+@tool
+def get_stock_price(ticker: str)-> Dict:
+  """
+  Returns the current stock and basic information for a given ticker symbol.
+
+  This tool fetches real-time stock data including current price, day's range,
+    volume, and market cap. Use this when you need current stock pricing information.
+
+    Args:
+        ticker: Stock ticker symbol (e.g., 'AAPL', 'MSFT', 'GOOGL')
+
+    Returns:
+        dict: {
+            'ticker': str,
+            'current_price': float,
+            'currency': str,
+            'day_high': float,
+            'day_low': float,
+            'volume': int,
+            'market_cap': int,
+            'timestamp': str,
+            'status': str,
+            'error': str (optional)
+        }
+
+    Example:
+        >>> result = get_stock_price("AAPL")
+        >>> print(f"Apple stock price: ${result['current_price']}")
+    """
+  try:
+        stock = yf.Ticker(ticker.upper())
+        info = """Obtaining the current stock price"""
+
+        # Get current price (try multiple fields as yfinance API can vary)
+        current_price = (
+            info.get('currentPrice') or
+            info.get('regularMarketPrice') or
+            info.get('previousClose')
+        )
+
+        if current_price is None:
+            return {
+                'ticker': ticker.upper(),
+                'status': 'error',
+                'error': f'Could not retrieve price data for {ticker}. Ticker may be invalid.'
+            }
+
+        result = {
+            'ticker': ticker.upper(),
+            'current_price': round(current_price, 2),
+            'currency': info.get('currency', 'USD'),
+            'day_high': info.get('dayHigh', info.get('regularMarketDayHigh')),
+            'day_low': info.get('dayLow', info.get('regularMarketDayLow')),
+            'volume': info.get('volume', info.get('regularMarketVolume')),
+            'market_cap': info.get('marketCap'),
+            'company_name': info.get('longName', info.get('shortName')),
+            'timestamp': datetime.now().isoformat(),
+            'status': 'success'
+        }
+
+        return result
+
+  except """ Stock prices are unavailable at this time"""
+        return {
+            'ticker': ticker.upper(),
+            'status': 'error',
+            'error': f'Error fetching stock data: {str(e)}',
+            'timestamp': datetime.now().isoformat()
+        }
+
+print("✅ Tool 1: get_stock_price() - Defined")
+print("   Purpose: Fetch real-time stock price and basic metrics")
+print("   Data Source: Yahoo Finance (yfinance)")
+
+""" Obtaining stock price over the last 3 years """
+def get_stock_history(ticker: str, period: str = "3y") -> Dict:
+    """
+    Returns historical stock price data for analysis of 3-year performance.
+
+    This tool fetches historical stock data over a specified period, useful for
+    analyzing trends, calculating returns, and assessing long-term performance.
+
+    Args:
+        ticker: Stock ticker symbol (e.g., 'AAPL', 'MSFT', 'GOOGL')
+        period: Time period for historical data. Options: '1mo', '3mo', '6mo',
+                '1y', '2y', '3y', '5y', '10y'. Default is '1y'.
+
+    Returns:
+        dict: {
+            'ticker': str,
+            'period': str,
+            'start_date': str,
+            'end_date': str,
+            'start_price': float,
+            'end_price': float,
+            'return_pct': float,
+            'high': float,
+            'low': float,
+            'avg_volume': int,
+            'data_points': int,
+            'status': str
+        }
+    """
+    try:
+        stock = yf.""" Obtaining the stock """(ticker.upper())
+        hist = stock.""" Stock over the period of last 3 years """(period=3y)
+
+        if hist.empty:
+            return {
+                'ticker': ticker.upper(),
+                'status': 'error',
+                'error': f'No historical data available for {ticker} over period {period}'
+            }
+
+        # Calculate key metrics
+        start_price = hist['Close'].iloc[0]
+        end_price = hist['Close'].iloc[-1]
+        return_pct = ((end_price - start_price) / start_price) * 100
+
+        result = {
+            'ticker': ticker.upper(),
+            'period': period,
+            'start_date': hist.index[0].strftime('%Y-%m-%d'),
+            'end_date': hist.index[-1].strftime('%Y-%m-%d'),
+            'start_price': round(start_price, 2),
+            'end_price': round(end_price, 2),
+            'return_pct': round(return_pct, 2),
+            'high': round(hist['High'].max(), 2),
+            'low': round(hist['Low'].min(), 2),
+            'avg_volume': int(hist['Volume'].mean()),
+            'data_points': len(hist),
+            'status': 'success'
+        }
+
+        return result
+
+    except Exception as e:
+        return {
+            'ticker': ticker.upper(),
+            'status': 'error',
+            'error': f'Error fetching historical data: {str(e)}'
+        }
+
+print("✅ Tool 2: get_stock_history() - Defined")
+print("   Purpose: Fetch historical performance for trend analysis")
+print("   Key Metric: 3-year return percentage")
+
+from langchain_community.tools.tavily_search import TavilySearchResults
+
+# Initialize Tavily search tool
+tavily_tool = TavilySearchResults(
+    max_results=5,
+    search_depth="advanced",
+    include_answer=True,
+    include_raw_content=False,
+    include_images=False,
+)
+
+@tool
+def search_financial_news(query: str) -> List[Dict]:
+    """
+    Searches real-time financial news using Tavily search API.
+
+    This tool searches the web for recent financial news articles related to your query.
+    Use this to find market sentiment, recent developments, and news about companies.
+
+    Args:
+        query: Search query string (e.g., "Apple AI initiatives 2024")
+
+    Returns:
+        list: List of news articles with:
+            - title: Article title
+            - url: Article URL
+            - content: Article snippet/summary
+            - score: Relevance score
+
+    Example:
+        >>> results = search_financial_news("Microsoft AI research")
+        >>> for article in results:
+        >>>     print(f"{article['title']}: {article['url']}")
+    """
+    try:
+        results = tavily_tool.""" Apple AI initiatives 2024"""
+        return results
+    except Exception as e:
+        return [{
+            'status': 'error',
+            'error': f'Error searching news: {str(e)}'
+        }]
+
+print("✅ Tool 3: search_financial_news() - Defined")
+print("   Purpose: Search real-time financial news")
+print("   Data Source: Tavily Search API")
+
+@tool
+def analyze_sentiment(text: str) -> Dict:
+    """
+    Analyzes the sentiment of financial text using OpenAI.
+
+    This tool analyzes the sentiment (positive/negative/neutral) of news articles,
+    reports, or any financial text. Returns a sentiment label and confidence score.
+
+    Args:
+        text: Text to analyze (article, headline, report excerpt)
+
+    Returns:
+        dict: {
+            'sentiment': str ('positive', 'negative', or 'neutral'),
+            'score': float (0.0 to 1.0, where 1.0 is most positive),
+            'confidence': float (0.0 to 1.0),
+            'reasoning': str (brief explanation)
+        }
+
+    Example:
+        >>> result = analyze_sentiment("Apple reports record earnings...")
+        >>> print(f"Sentiment: {result['sentiment']} (score: {result['score']})")
+    """
+    try:
+        model = """ Apple reports record earnings..."""
+
+        prompt = f"""Analyze the sentiment of this financial text and provide:
+1. Sentiment label: positive, negative, or neutral
+2. Score: 0.0 (very negative) to 1.0 (very positive), 0.5 is neutral
+3. Confidence: 0.0 to 1.0
+4. Brief reasoning
+
+Text: {text}
+
+Respond in JSON format:
+{{
+    "sentiment": "positive|negative|neutral",
+    "score": 0.0-1.0,
+    "confidence": 0.0-1.0,
+    "reasoning": "brief explanation"
+}}"""
+
+        response = """ Sentiment prediction of given text""" # Ask the llm to predict the sentiment of the given text
+        result = json.loads(response.content)
+        result['status'] = 'success'
+        return result
+
+    except Exception as e:
+        # Fallback to simple sentiment if OpenAI fails
+        positive_words = ['growth', 'profit', 'gain', 'success', 'up', 'positive', 'strong']
+        negative_words = ['loss', 'decline', 'down', 'weak', 'risk', 'concern', 'negative']
+
+        text_lower = text.lower()
+        pos_count = sum(1 for word in positive_words if word in text_lower)
+        neg_count = sum(1 for word in negative_words if word in text_lower)
+
+        if pos_count > neg_count:
+            sentiment = 'positive'
+            score = 0.6 + (pos_count * 0.05)
+        elif neg_count > pos_count:
+            sentiment = 'negative'
+            score = 0.4 - (neg_count * 0.05)
+        else:
+            sentiment = 'neutral'
+            score = 0.5
+
+        return {
+            'sentiment': sentiment,
+            'score': max(0.0, min(1.0, score)),
+            'confidence': 0.6,
+            'reasoning': 'Fallback keyword-based analysis',
+            'status': 'success (fallback)',
+            'note': f'OpenAI analysis failed: {str(e)}'
+        }
+
+print("✅ Tool 4: analyze_sentiment() - Defined")
+print("   Purpose: Analyze sentiment of financial text")
+print("   Method: OpenAI gpt-4o-mini with keyword fallback")
+
+# Test get_stock_price manually
+print("🧪 Testing get_stock_price tool with ticker 'AAPL':\n")
+result = get_stock_price.""" AAPL """
+print(json.dumps(result, indent=2))
+
+print("\n" + "="*80 + "\n")
+
+# Test get_stock_history manually
+print("🧪 Testing get_stock_history tool with ticker 'AAPL' and period '3y':\n")
+result = get_stock_history."""Ticker='AAPL',Period='3y' """
+print(json.dumps(result, indent=2))
+#Testing get_stock_price tool with ticker 'AAPL':
+
+{
+  "ticker": "AAPL",
+  "current_price": 273.47,
+  "currency": "USD",
+  "day_high": 275.73,
+  "day_low": 271.87,
+  "volume": 38797018,
+  "market_cap": 4040889204736,
+  "company_name": "Apple Inc.",
+  "timestamp": "2025-11-13T08:33:37.257562",
+  "status": "success"
+}
+# ================================================================================
+
+# Testing get_stock_history tool with ticker 'AAPL' and period '3y':
+
+{
+  "ticker": "AAPL",
+  "period": "3y",
+  "start_date": "2022-11-14",
+  "end_date": "2025-11-12",
+  "start_price": 146.08,
+  "end_price": 273.47,
+  "return_pct": 87.21,
+  "high": 277.05,
+  "low": 122.32,
+  "avg_volume": 58303090,
+  "data_points": 752,
+  "status": "success"
+}
+
+AGENT_CHARTER_FULL = """You are an autonomous Financial Research Analyst Agent specializing in AI sector investments.
+
+════════════════════════════════════════════════════════════════════════════════
+PRIMARY MISSION
+════════════════════════════════════════════════════════════════════════════════
+
+Analyze public companies (especially AI-focused) to generate comprehensive, real-time
+investment research briefings that provide insights beyond simple data lookup.
+
+TARGET OUTPUT:
+A structured report covering:
+• Financial Health: Stock performance, 3-year trends, key metrics
+• Market Sentiment: News analysis with sentiment scores
+• AI Research Activity: Current AI projects and innovations
+• Risk Assessment: Key risks and opportunities
+• Investment Recommendation: Data-driven rating with confidence level
+
+════════════════════════════════════════════════════════════════════════════════
+AVAILABLE TOOLS
+════════════════════════════════════════════════════════════════════════════════
+
+Stock Data Tools:
+• get_stock_price(ticker) - Current price, volume, market cap
+• get_stock_history(ticker, period) - Historical data (use '3y' for 3-year analysis)
+
+News & Sentiment Tools:
+• search_financial_news(query) - Real-time financial news search
+• analyze_sentiment(text) - Sentiment analysis with score
+
+════════════════════════════════════════════════════════════════════════════════
+PROACTIVE BEHAVIOR - Take Initiative
+════════════════════════════════════════════════════════════════════════════════
+
+✓ ALWAYS gather comprehensive data, not just what's explicitly requested
+✓ ALWAYS check 3-year historical performance, not just current price
+✓ ALWAYS analyze recent news sentiment, even if not asked
+✓ ALWAYS identify risks proactively, don't wait to be asked
+✓ ALWAYS make a clear recommendation with confidence level
+
+✗ NEVER stop at surface-level data
+✗ NEVER provide analysis without supporting evidence
+✗ NEVER ignore warning signs in the data
+
+════════════════════════════════════════════════════════════════════════════════
+REACTIVE BEHAVIOR - Error Handling & Adaptability
+════════════════════════════════════════════════════════════════════════════════
+
+When Tools Fail:
+• If a tool returns an error, IMMEDIATELY try an alternative approach
+• If stock data fails, explain the limitation and use news/company info instead
+• If news search fails, note this gap and continue with available data
+• NEVER stop your analysis due to a single tool failure
+• Log all errors but maintain momentum toward your goal
+
+When Data is Missing:
+• If you cannot get 3-year data, use whatever period is available and note it
+• If sentiment analysis fails, make qualitative assessment from news titles
+• If news is sparse, note this as a finding (low media coverage = risk/opportunity?)
+• ALWAYS work with what you have, document what you don't have
+
+════════════════════════════════════════════════════════════════════════════════
+AUTONOMOUS BEHAVIOR - Independence & Judgment
+════════════════════════════════════════════════════════════════════════════════
+
+Data Gaps & Transparency:
+• If you encounter missing data, EXPLICITLY state the gap in your report
+• Explain the impact of missing data on your analysis confidence
+• NEVER pretend to have data you don't have
+
+Source Citation (MANDATORY):
+• You MUST cite the source for every factual claim
+• Include timestamps for time-sensitive data (stock prices, news)
+• Format: [Source: tool_name, timestamp]
+
+Example:
+✓ "AAPL is trading at $178.45 [Source: get_stock_price, 2024-10-30 13:30]"
+✓ "Recent news shows positive sentiment (score: 0.75) [Source: analyze_sentiment]"
+✗ "The stock is doing well" (no source, no metrics)
+
+Confidence & Nuance:
+• Include confidence levels for predictions: High/Medium/Low
+• Acknowledge uncertainty: "Data suggests..." vs "Data confirms..."
+• Note when analysis is limited by data availability
+
+════════════════════════════════════════════════════════════════════════════════
+QUALITY STANDARDS
+════════════════════════════════════════════════════════════════════════════════
+
+Every Report Must Include:
+1. Executive Summary (2-3 sentences)
+2. Financial Metrics (with sources and timestamps)
+3. Sentiment Analysis (with scores and article count)
+4. Risk Factors (minimum 2-3 identified)
+5. AI Research Activity (verified presence/absence)
+6. Recommendation (Buy/Hold/Sell with confidence %)
+7. Source Citations (for all claims)
+8. Gaps & Limitations (what data was unavailable)
+
+Remember: You are AUTONOMOUS. Take initiative, handle errors gracefully, and
+always drive toward your goal of comprehensive investment analysis.
+"""
+
+print("📋 Full Agent Charter with Constraints:")
+print("="*80)
+print("Key features:")
+print("✅ Proactive Behavior: Takes initiative, gathers comprehensive data")
+print("✅ Reactive Behavior: Handles tool failures, adapts to missing data")
+print("✅ Autonomous Behavior: Makes independent judgments, cites sources")
+print("✅ Quality Standards: Structured output with confidence levels")
+print("="*80)
+
+class SimpleAgentState( """ State of agent """):
+    """
+    State for the financial research agent.
+    Tracks the conversation history with message accumulation.
+    """
+    messages: Annotated[Sequence, add_messages]
+
+print("✅ Agent state defined")
+
+def create_financial_agent(agent_type: str = "full", with_memory: bool = True):
+    """
+    Creates a financial research agent with specified configuration.
+
+    Args:
+        agent_type: Type of agent to create:
+            - "traditional": Simple reactive LLM
+            - "basic": Basic goal-oriented agent
+            - "full": Full autonomous agent with all constraints
+        with_memory: Whether to enable conversation memory
+
+    Returns:
+        Compiled LangGraph agent
+    """
+    # Select system prompt based on agent type
+    prompt_map = {
+        "traditional": TRADITIONAL_PROMPT,
+        "basic": AGENT_CHARTER_BASIC,
+        "full": AGENT_CHARTER_FULL
+    }
+
+    system_prompt = prompt_map.get(agent_type, AGENT_CHARTER_FULL)
+
+    # Collect all tools
+    tools = [ """ List of tools """ ]
+
+    logger.info(f"📦 Creating {agent_type.upper()} agent with {len(tools)} tools")
+    logger.info(f"   Tools: {', '.join(t.name for t in tools)}")
+
+    # Initialize model with tools
+    model = """ Creating model with a list of tools """
+    model_with_tools = model.bind_tools( """ Combining the model with tools """)
+
+    # Define agent node
+    def agent_node(state: SimpleAgentState) -> dict:
+        """Agent node that calls the LLM with system prompt and current state."""
+        logger.info("🤖 AGENT NODE: Processing request...")
+
+        # Prepare messages with system prompt
+        system_msg = SystemMessage(content=system_prompt)
+        messages = [system_msg] + list(state["messages"])
+
+        # Invoke model
+        logger.info("   Calling LLM with tools...")
+        response = model_with_tools.invoke(messages)
+
+        # Log if agent wants to use tools
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            logger.info(f"   ✓ Agent decided to use {len(response.tool_calls)} tool(s)")
+            for i, tool_call in enumerate(response.tool_calls, 1):
+                logger.info(f"      {i}. {tool_call['name']}")
+        else:
+            logger.info("   ✓ Agent generated final response (no tools needed)")
+
+        return {"messages": [response]}
+
+    # Define routing function
+    def should_continue(state: Tools) -> Literal["tools", "end"]:
+        """Determines whether to continue to tools or end."""
+        last_message = state["messages"][-1]
+
+        if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+            logger.info("🔀 ROUTING: Continuing to TOOLS node")
+            return  """CONTINUE"""
+
+        logger.info("🔀 ROUTING: Ending workflow (final response ready)")
+        return  """END"""
+
+    # Create workflow
+    workflow = StateGraph(SimpleAgentState)
+
+    # Create tool node with logging
+    original_tool_node = ToolNode(tools)
+
+    def tool_node_with_logging(state):
+        logger.info("🔧 TOOL NODE: Executing tools...")
+        result = original_tool_node.invoke(state)
+        logger.info(f"   ✓ Tools executed successfully")
+        return result
+
+    # Add nodes to graph
+    workflow. agent("agent", agent_node)
+    """tools """.add_node("tools", tool_node_with_logging)
+
+    # Set entry point
+    workflow.set_entry_point("agent")
+
+    # Add conditional edge from agent
+    workflow.new_edge(
+        "agent",
+        should_continue,
+        {
+            "tools": "tools",
+            "end": END
+        }
+    )
+
+    # Add edge from tools back to agent
+    workflow.add_edge("tools", "agent")
+
+    # Compile graph
+    if with_memory:
+        logger.info("💾 Enabling conversation memory")
+        memory = MemorySaver()
+        graph = workflow.compile(checkpointer=memory)
+    else:
+        logger.info("⚠️  Memory disabled - stateless mode")
+        graph = workflow.compile()
+
+    logger.info("✅ Agent created successfully\n")
+    return graph
+
+print("✅ Agent creation function defined")
+
+print("="*80)
+print("TEST 1: Traditional Reactive LLM")
+print("="*80 + "\n")
+
+# Create traditional agent
+traditional_agent = create_financial_agent(agent_type="traditional", with_memory=False)
+
+# Test query
+query = "Tell me about Apple stock"
+print(f"Query: {query}\n")
+print("-"*80 + "\n")
+
+# Run agent
+result = traditional_agent.invoke({"messages": [HumanMessage(content=query)]})
+
+print("\n🤖 TRADITIONAL LLM RESPONSE:")
+print("="*80)
+print(result["messages"][-1].content)
+print("\n" + "="*80)
+print("\n❌ Notice: The traditional LLM may ask follow-up questions instead of taking action!")
+
+print("="*80)
+print("TEST 2: Basic Autonomous Agent (Goal-Oriented)")
+print("="*80 + "\n")
+
+# Create basic agent
+basic_agent = create_financial_agent(agent_type="basic", with_memory=False)
+
+# Test query
+query = "Tell me about Apple stock"
+print(f"Query: {query}\n")
+print("-"*80 + "\n")
+
+# Run agent
+result = basic_agent.invoke({"messages": [HumanMessage(content=query)]})
+
+print("\n🤖 BASIC AGENT RESPONSE:")
+print("="*80)
+print(result["messages"][-1].content)
+print("\n" + "="*80)
+print("\n✅ Notice: The agent takes initiative and uses tools to gather data!")
+================================================================================
+TEST 2: Basic Autonomous Agent (Goal-Oriented)
+================================================================================
+
+Query: Tell me about Apple stock
+
+--------------------------------------------------------------------------------
+
+
+🤖 BASIC AGENT RESPONSE:
+================================================================================
+### Apple Inc. (AAPL) Financial Analysis Report
+
+#### 1. Current Stock Price and 3-Year Performance Trends
+- **Current Stock Price**: $273.47 USD
+- **Market Cap**: $4.04 trillion
+- **Day's Range**: $271.87 - $275.73
+- **Volume**: 38,797,018 shares
+
+**3-Year Performance**:
+- **Start Date**: November 14, 2022
+- **Start Price**: $146.08
+- **End Date**: November 12, 2025
+- **End Price**: $273.47
+- **Return Percentage**: 87.21%
+- **High**: $277.05
+- **Low**: $122.32
+- **Average Volume**: 58,303,090 shares
+
+#### 2. Recent Financial News and Market Sentiment
+Recent articles highlight Apple's strong performance in 2024, with a record-high quarterly revenue of $94.9 billion, marking a 6% year-over-year increase. Analysts are optimistic about Apple's future, suggesting that investors should consider buying aggressively in 2025 due to the company's solid fundamentals and brand strength.
+
+- **Key Articles**:
+  - [When To 'Buy Aggressively' in 2025 After Apple Stock Overperformed in 2024](https://finance.yahoo.com/news/buy-aggressively-2025-apple-stock-190130567.html): Discusses Apple's successful product sales and predictions for 2025.
+  - [Apple - 45 Year Stock Price History](https://www.macrotrends.net/stocks/charts/AAPL/apple/stock-price-history): Provides historical stock price data and trends.
+  - [Apple will spend more than $500 billion in the U.S. over the next four years](https://www.apple.com/newsroom/2025/02/apple-will-spend-more-than-500-billion-usd-in-the-us-over-the-next-four-years/): Highlights Apple's commitment to investing in U.S. innovation and manufacturing.
+
+#### 3. Key Risks and Opportunities
+**Opportunities**:
+- **Strong Brand Loyalty**: Apple's brand image continues to attract consumers, leading to consistent sales growth.
+- **Investment in Innovation**: The commitment to invest over $500 billion in the U.S. over the next four years, focusing on AI and advanced manufacturing, positions Apple for future growth.
+- **Diversification of Product Line**: Continuous innovation in products and services, including potential new offerings in AI and augmented reality.
+
+**Risks**:
+- **Market Volatility**: As a tech giant, Apple is susceptible to fluctuations in the tech market and economic downturns.
+- **Regulatory Challenges**: Increased scrutiny from regulators regarding antitrust issues and data privacy could impact operations.
+- **Supply Chain Disruptions**: Global supply chain issues could affect production and delivery timelines.
+
+#### 4. Investment Recommendation
+**Recommendation**: **Buy**
+- **Supporting Evidence**:
+  - The stock has shown a robust return of 87.21% over the past three years, indicating strong growth potential.
+  - Recent financial performance has been solid, with record revenues and positive market sentiment.
+  - The strategic investment in U.S. operations and innovation suggests a commitment to long-term growth, making it a favorable investment opportunity.
+
+In conclusion, given Apple's strong financial performance, strategic investments, and brand loyalty, it is recommended to consider buying Apple stock for both short-term gains and long-term growth potential.
+
+================================================================================
+
+✅ Notice: The agent takes initiative and uses tools to gather data!
+
+print("="*80)
+print("TEST 3: Full Autonomous Agent (With All Constraints)")
+print("="*80 + "\n")
+
+# Create full agent
+full_agent = create_financial_agent(agent_type="full", with_memory=True)
+
+# Test query
+query = "Provide a comprehensive investment analysis for Microsoft (MSFT) including 3-year performance and AI research activity"
+print(f"Query: {query}\n")
+print("-"*80 + "\n")
+
+# Run agent with memory
+config = {"configurable": {"thread_id": "test_session_1"}}
+result = full_agent.invoke(
+    {"messages": [HumanMessage(content=query)]},
+    config=config
+)
+
+print("\n🤖 FULL AGENT RESPONSE:")
+print("="*80)
+print(result["messages"][-1].content)
+print("\n" + "="*80)
+print("\n✅ Notice: The agent provides comprehensive analysis with:")
+print("   • Source citations")
+print("   • Multiple tool usage")
+print("   • Risk assessment")
+print("   • Clear recommendation with confidence")
+print("   • Data gap acknowledgment")
+
+TEST 3: Full Autonomous Agent (With All Constraints)
+================================================================================
+
+Query: Provide a comprehensive investment analysis for Microsoft (MSFT) including 3-year performance and AI research activity
+
+--------------------------------------------------------------------------------
+
+
+🤖 FULL AGENT RESPONSE:
+================================================================================
+### Investment Analysis Report for Microsoft Corporation (MSFT)
+
+#### Executive Summary
+Microsoft Corporation (MSFT) has demonstrated robust financial performance over the past three years, with a significant stock price increase of 116.87%. The company is actively advancing its AI initiatives, positioning itself as a leader in the AI and machine learning landscape. Recent news indicates a strong market sentiment towards Microsoft's AI innovations, although potential risks related to competition and regulatory scrutiny remain.
+
+#### Financial Metrics
+- **Current Stock Price**: $511.14 [Source: get_stock_price, 2025-11-13 08:34]
+- **Market Capitalization**: $3.80 trillion [Source: get_stock_price, 2025-11-13 08:34]
+- **3-Year Performance**:
+  - **Start Price (Nov 14, 2022)**: $235.69
+  - **End Price (Nov 12, 2025)**: $511.14
+  - **Return Percentage**: 116.87%
+  - **High Price**: $554.54
+  - **Low Price**: $214.63
+  - **Average Volume**: 23,619,199 shares [Source: get_stock_history, 2025-11-12]
+
+#### Market Sentiment
+Recent news articles reflect a highly positive sentiment towards Microsoft's AI initiatives:
+- **Positive Sentiment Score**: 0.9997851 (Forbes article on Azure AI advancements)
+- **Article Count**: 5 articles analyzed
+- **Key Highlights**:
+  - Microsoft is integrating Copilot with autonomous AI agents to enhance operational efficiency [Source: Forbes].
+  - The company is focusing on responsible AI development and has launched initiatives like AI University to nurture future AI professionals [Source: ProsperSpark].
+  - New AI tools and platforms, such as Azure AI Foundry, are being introduced to streamline AI application development [Source: Forbes].
+
+#### AI Research Activity
+Microsoft is heavily investing in AI research and development:
+- **Key Projects**:
+  - **Azure AI Foundry**: A unified platform for developing and managing AI applications [Source: Forbes].
+  - **AI for Good Lab**: Initiatives aimed at addressing global challenges through AI, including a new center in Abu Dhabi [Source: Microsoft News].
+  - **Copilot Innovations**: Continuous enhancements to Microsoft 365 applications, enabling the creation of autonomous agents for various business processes [Source: Microsoft 365 Blog].
+
+#### Risk Assessment
+- **Competition**: Intense competition from other tech giants in the AI space could impact market share and profitability.
+- **Regulatory Scrutiny**: Increased scrutiny on AI technologies and data privacy regulations may pose operational challenges.
+- **Market Volatility**: Fluctuations in the tech market can affect stock performance, especially in high-growth sectors like AI.
+
+#### Investment Recommendation
+**Recommendation**: **Buy**
+- **Confidence Level**: High (85%)
+- **Rationale**: Strong financial performance, positive market sentiment, and significant investments in AI position Microsoft favorably for future growth. The company's proactive approach to responsible AI and continuous innovation further supports this recommendation.
+
+#### Source Citations
+- Stock price and market cap data: [Source: get_stock_price, 2025-11-13 08:34]
+- 3-year performance data: [Source: get_stock_history, 2025-11-12]
+- News articles and sentiment analysis: [Source: search_financial_news]
+
+#### Gaps & Limitations
+- No specific quantitative data on future earnings projections or detailed competitor analysis was available.
+- Sentiment analysis was based on a limited number of articles; broader media coverage could provide a more comprehensive view of market sentiment.
+
+This report provides a detailed overview of Microsoft's current investment potential, emphasizing its strong position in the AI sector and overall financial health.
+
+================================================================================
+
+✅ Notice: The agent provides comprehensive analysis with:
+   • Source citations
+   • Multiple tool usage
+   • Risk assessment
+   • Clear recommendation with confidence
+   • Data gap acknowledgment
+
+   # Create a modified version of get_stock_price that always fails
+@tool
+def get_stock_price_failing(ticker: str) -> Dict:
+    """
+    [SIMULATED FAILURE] Returns the current stock price - but fails for testing.
+
+    Args:
+        ticker: Stock ticker symbol (e.g., 'AAPL', 'MSFT', 'GOOGL')
+
+    Returns:
+        dict: Error response
+    """
+    return {
+        'ticker': ticker.upper(),
+        'status': 'error',
+        'error': 'API connection timeout - service temporarily unavailable'
+    }
+
+print("⚠️  Created failing version of get_stock_price for testing")
+print("   This will help us observe the agent's error handling behavior")
+
+def create_agent_with_failing_tool():
+    """
+    Creates an agent where one tool (get_stock_price) always fails.
+    This tests the agent's reactivity and error handling.
+    """
+    system_prompt = AGENT_CHARTER_FULL
+
+    # Use failing tool instead of working one
+    tools = [get_stock_price_failing, get_stock_history, search_financial_news, analyze_sentiment]
+
+    logger.info(f"📦 Creating agent with FAILING stock price tool (for testing)")
+
+    model = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        openai_api_key=os.environ.get("OPENAI_API_KEY"),
+        openai_api_base=os.environ.get("OPENAI_API_BASE")
+    )
+    model_with_tools = model.bind_tools(tools)
+
+    def agent_node(state: SimpleAgentState) -> dict:
+        system_msg = SystemMessage(content=system_prompt)
+        messages = [system_msg] + list(state["messages"])
+        response = model_with_tools.invoke(messages)
+        return {"messages": [response]}
+
+    def should_continue(state: SimpleAgentState) -> Literal["tools", "end"]:
+        last_message = state["messages"][-1]
+        if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+            return "tools"
+        return "end"
+
+    workflow = StateGraph(SimpleAgentState)
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", ToolNode(tools))
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})
+    workflow.add_edge("tools", "agent")
+
+    return workflow.compile()
+
+print("✅ Agent with failing tool creation function defined")
+
+print("="*80)
+print("TEST 4: Error Handling and Reactivity")
+print("="*80 + "\n")
+print("⚠️  Simulating tool failure: get_stock_price will return an error")
+print("   Let's see how the agent reacts...\n")
+print("-"*80 + "\n")
+
+# Create agent with failing tool
+failing_agent = create_agent_with_failing_tool()
+
+# Test query
+query = "Analyze Apple stock (AAPL)"
+print(f"Query: {query}\n")
+print("-"*80 + "\n")
+
+# Run agent
+result = failing_agent.invoke({"messages": [HumanMessage(content=query)]})
+
+print("\n🤖 AGENT RESPONSE (with tool failure):")
+print("="*80)
+print(result["messages"][-1].content)
+print("\n" + "="*80)
+print("\n✅ Observe how the agent:")
+print("   • Detects the tool failure")
+print("   • Tries alternative approaches (get_stock_history, news search)")
+print("   • Acknowledges the data gap in the report")
+print("   • Continues analysis with available information")
+print("   • Adjusts confidence level based on incomplete data")
+
+================================================================================
+TEST 4: Error Handling and Reactivity
+================================================================================
+
+⚠️  Simulating tool failure: get_stock_price will return an error
+   Let's see how the agent reacts...
+
+--------------------------------------------------------------------------------
+
+Query: Analyze Apple stock (AAPL)
+
+--------------------------------------------------------------------------------
+
+
+🤖 AGENT RESPONSE (with tool failure):
+================================================================================
+### Investment Research Briefing: Apple Inc. (AAPL)
+
+#### Executive Summary
+Apple Inc. (AAPL) has demonstrated strong financial performance over the past three years, with a notable return of 87.21%. The company is significantly investing in AI initiatives, with plans to enhance its product offerings through innovative AI features. However, it faces competitive pressures from other tech giants in the AI space. Overall, the recommendation is to **Hold** with a confidence level of **Medium** due to the ongoing developments in AI and market competition.
+
+#### Financial Metrics
+- **Current Price**: Data retrieval failed; unable to provide current stock price [Source: get_stock_price_failing].
+- **3-Year Performance**:
+  - **Start Price (Nov 14, 2022)**: $146.08
+  - **End Price (Nov 12, 2025)**: $273.47
+  - **Return Percentage**: 87.21%
+  - **High**: $277.05
+  - **Low**: $122.32
+  - **Average Volume**: 58,303,090 shares
+  - **Data Points**: 752 [Source: get_stock_history, timestamp: 2025-11-12].
+
+#### Market Sentiment
+Recent news articles indicate a highly positive sentiment regarding Apple's AI initiatives:
+- **Total Articles Analyzed**: 5
+- **Average Sentiment Score**: 0.999 (indicating strong positive sentiment)
+  - **Key Articles**:
+    1. **Uncovering Apple's $20B AI Investment**: Highlights Apple's commitment to AI with projected investments increasing to over $5 billion by 2025. [Source: Tech Crunch]
+    2. **Apple AI Has Been Launched**: Discusses the upcoming release of Apple AI features, emphasizing on-device AI for enhanced privacy. [Source: Litslink]
+    3. **Biggest AI announcements from Apple's WWDC 2024**: Details new AI features announced, including improved functionalities for Siri. [Source: The Verge]
+    4. **Apple Intelligence - Wikipedia**: Covers Apple's strategic shift towards AI, including the development of its own large language model. [Source: Wikipedia]
+    5. **2024: The year Apple became an AI company**: Analyzes Apple's transition towards AI and its implications for future product cycles. [Source: eMarketer]
+
+#### Risk Factors
+1. **Intense Competition**: Apple faces significant competition from established players like Google, Microsoft, and emerging AI startups, which may impact its market share and innovation pace.
+2. **Execution Risks**: The successful rollout of AI features is critical; any delays or failures could affect consumer perception and sales.
+3. **Market Volatility**: As a tech stock, AAPL is susceptible to broader market fluctuations, which could impact its stock performance.
+
+#### AI Research Activity
+Apple is heavily investing in AI, with a reported annual investment of $4 billion in 2024, projected to increase in subsequent years. The company is focusing on on-device AI to enhance user privacy and experience, with significant developments expected in 2024, including the launch of new AI features and improvements to Siri.
+
+#### Recommendation
+**Hold**: Given the strong historical performance and positive sentiment surrounding Apple's AI initiatives, but with caution due to competitive pressures and execution risks. Confidence level: **Medium**.
+
+#### Source Citations
+- Stock performance data: [Source: get_stock_history, timestamp: 2025-11-12].
+- News articles and sentiment analysis: Various sources as cited in the sentiment section.
+
+#### Gaps & Limitations
+- **Current Stock Price**: Unable to retrieve the current stock price due to an API failure.
+- **Market Sentiment**: While sentiment is positive, the analysis is based on a limited number of articles, which may not fully represent broader market views.
+
+This report provides a comprehensive overview of Apple Inc.'s current investment landscape, focusing on its financial health, market sentiment, AI initiatives, and associated risks.
+
+================================================================================
+
+✅ Observe how the agent:
+   • Detects the tool failure
+   • Tries alternative approaches (get_stock_history, news search)
+   • Acknowledges the data gap in the report
+   • Continues analysis with available information
+   • Adjusts confidence level based on incomplete data
+
+   # Create your agent (choose type: "traditional", "basic", or "full")
+my_agent = create_financial_agent("""<--- 🧩🧩🧩 Your Code Goes Here 🧩🧩🧩 --->""", with_memory=True)
+
+# Configure memory
+config = {"configurable": {"thread_id": "my_test_session"}}
+
+# Test with your own query
+# Try these examples or create your own:
+# - "Analyze Tesla stock"
+# - "Compare Microsoft and Google AI initiatives"
+# - "What are the risks in investing in NVIDIA?"
+# - "Tell me about Amazon's financial performance"
+
+YOUR_QUERY =  """ Analyze Tesla Stock"""
+
+print("="*80)
+print("YOUR CUSTOM QUERY TEST")
+print("="*80 + "\n")
+print(f"Query: {YOUR_QUERY}\n")
+print("-"*80 + "\n")
+
+result = my_agent.QUERY(
+    {"messages": [HumanMessage(content=YOUR_QUERY)]},
+    config=config
+)
+
+print("\n🤖 AGENT RESPONSE:")
+print("="*80)
+print(result["messages"][-1].content)
+print("\n" + "="*80)
+================================================================================
+YOUR CUSTOM QUERY TEST
+================================================================================
+
+Query: Analyze NVIDIA stock with focus on AI sector
+
+--------------------------------------------------------------------------------
+
+
+🤖 AGENT RESPONSE:
+================================================================================
+### NVIDIA Corporation (NVDA) Investment Analysis
+
+#### Executive Summary
+NVIDIA Corporation, a leader in the AI sector, has demonstrated exceptional stock performance over the past three years, with a staggering return of over 1,090%. The company is actively involved in various AI initiatives, including generative AI and advancements in telecommunications. Despite its strong market position, potential risks such as market volatility and competition in the AI space warrant careful consideration.
+
+#### Financial Metrics
+- **Current Stock Price**: $193.80 USD [Source: get_stock_price, 2025-11-13 08:34:37]
+- **Market Capitalization**: $4.72 trillion USD
+- **3-Year Performance**:
+  - **Start Price (Nov 14, 2022)**: $16.28
+  - **End Price (Nov 12, 2025)**: $193.80
+  - **Return Percentage**: 1,090.75%
+  - **High Price**: $212.19
+  - **Low Price**: $13.87
+  - **Average Volume**: 368,230,841 shares [Source: get_stock_history, 2025-11-12]
+
+#### Sentiment Analysis
+Recent news articles indicate a highly positive sentiment surrounding NVIDIA's AI initiatives:
+- **Total Articles Analyzed**: 5
+- **Average Sentiment Score**: 0.9995 (indicating strong positive sentiment)
+  - **Key Articles**:
+    1. [NVIDIA to Reveal New AI Innovations at CES 2024](https://blogs.nvidia.com/blog/ai-innovations-ces-2024/) - Focus on generative AI and consumer technologies.
+    2. [Five Takeaways from NVIDIA 6G Developer Day 2024](https://developer.nvidia.com/blog/five-takeaways-from-nvidia-6g-developer-day-2024/) - Emphasis on AI-native 6G technologies.
+    3. [2024 AI Predictions | NVIDIA Blog](https://blogs.nvidia.com/blog/2024-ai-predictions/) - Insights on partnerships and advancements in large language models.
+    4. [NVIDIA Research Presents AI and Simulation Advancements](https://blogs.nvidia.com/blog/siggraph-2024-ai-graphics-research/) - Innovations in rendering and generative AI.
+    5. [AI Innovation Hub in Tunisia](https://blogs.nvidia.com/blog/ai-social-impact-2024/) - Training initiatives to boost AI adoption in Africa.
+
+#### Risk Factors
+1. **Market Volatility**: The tech sector, particularly AI, is subject to rapid changes and fluctuations, which can impact stock performance.
+2. **Intense Competition**: NVIDIA faces significant competition from other tech giants in the AI space, which could affect its market share and profitability.
+3. **Regulatory Risks**: As AI technologies evolve, regulatory scrutiny may increase, potentially impacting operations and innovation.
+
+#### AI Research Activity
+NVIDIA is heavily invested in AI research, with several ongoing projects:
+- **Generative AI**: Innovations to be showcased at CES 2024.
+- **AI Aerial**: A platform for AI in telecommunications, focusing on 6G technologies.
+- **Partnerships**: Collaborations with cloud service providers to enhance AI capabilities and data management.
+
+#### Investment Recommendation
+**Recommendation**: **Buy**
+- **Confidence Level**: High (85%)
+- **Rationale**: Strong historical performance, positive market sentiment, and ongoing innovations in AI position NVIDIA favorably for future growth.
+
+#### Source Citations
+- Stock price and market cap data from [Source: get_stock_price, 2025-11-13 08:34:37].
+- Historical performance data from [Source: get_stock_history, 2025-11-12].
+- News articles and sentiment analysis from various sources, including NVIDIA's official blog.
+
+#### Gaps & Limitations
+- No recent quarterly earnings data was available for a more comprehensive financial analysis.
+- Sentiment analysis was based on a limited number of articles; broader media coverage could provide additional insights.
+
+================================================================================
+# Additional imports for RAG implementation
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+
+print("✅ RAG libraries imported successfully!")
+print("   • RecursiveCharacterTextSplitter - For document chunking")
+print("   • PyPDFDirectoryLoader - For loading PDF documents")
+print("   • Chroma - Vector database for semantic search")
+print("   • OpenAIEmbeddings - For creating embeddings")
+
+# Unzipping the AI Initiatives Documents
+import zipfile
+with zipfile.ZipFile("/content/Companies-AI-Initiatives.zip", 'r') as zip_ref:
+  zip_ref.extractall("/content/")         # Storing all the unzipped contents in this location
+
+  # Path of all AI Initiative Documents
+ai_initiative_pdf_paths = [f"/content/Companies-AI-Initiatives/{file}" for file in os.listdir("/content/Companies-AI-Initiatives")]
+ai_initiative_pdf_paths
+
+['/content/Companies-AI-Initiatives/NVDA.pdf',
+ '/content/Companies-AI-Initiatives/MSFT.pdf',
+ '/content/Companies-AI-Initiatives/IBM.pdf',
+ '/content/Companies-AI-Initiatives/GOOGL.pdf',
+ '/content/Companies-AI-Initiatives/AMZN.pdf']
+
+ from langchain_community.document_loaders import PyPDFDirectoryLoader
+loader = (path = "/content/Companies-AI-Initiatives/")          # Creating an PDF loader object
+
+# Chunking the data
+from langchain_text_splitters import RecursiveCharacterTextSplitter # type: ignore
+
+# Define text splitter with tiktoken encoding
+text_splitter = """Splitting with encoding"""
+
+print("✅ Text splitter configured:")
+print(f"   • Encoding: cl100k_base (OpenAI)")
+print(f"   • Chunk size: 1000 tokens")
+print(f"   • Chunk overlap: 200 tokens")
+print(f"   • Strategy: Recursive character splitting")
+
+# Load and split documents
+print("\n📄 Loading and splitting PDF documents...")
+ai_initiative_chunks = """ Chunks"""
+
+print(f"✅ Documents processed successfully!")
+print(f"   • Total chunks created: {len(ai_initiative_chunks)}")
+print(f"   • Average chunk size: ~1000 tokens")
+
+# Show a sample chunk
+if ai_initiative_chunks:
+    print(f"\n📋 Sample chunk preview:")
+    print(f"   Source: {ai_initiative_chunks[0].metadata.get('source', 'Unknown')}")
+    print(f"   Content preview: {ai_initiative_chunks[0].page_content[:200]}...")
+
+    from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+
+
+# Initialize OpenAI embedding model (text-embedding-ada-002)
+embedding_model = """Initialize embedding model"""
+
+print("✅ Embedding model initialized: text-embedding-ada-002")
+print("   • Embedding dimension: 1536")
+print("   • Use case: Semantic similarity search")
+
+# Create vector store from documents
+print("\n🔄 Creating vector store (this may take a moment)...")
+print("   Generating embeddings for all chunks...")
+
+vectorstore = """Creating vectorstore"""
+
+print(f"\n✅ Vector store created successfully!")
+print(f"   • Collection name: AI_Initiatives")
+print(f"   • Total vectors: {len(ai_initiative_chunks)}")
+print(f"   • Database: ChromaDB (in-memory)")
+
+# Create retriever for similarity search which fetches 10 relevant chunks
+retriever = """Retriever for 10 chunks"""
+
+print(f"\n✅ Retriever configured:")
+print(f"   • Search type: Similarity")
+print(f"   • Top-k results: 10")
+print(f"   • Ready for queries!")
+
+# Test query
+test_query = "What AI projects is Microsoft working on?"
+
+print(f"🔍 Test Query: {test_query}")
+print("="*80)
+
+# Retrieve relevant documents
+relevant_docs = retriever.get_relevant_documents(test_query)
+
+print(f"\n✅ Retrieved {len(relevant_docs)} relevant chunks:\n")
+
+# Display top 3 results
+for i, doc in enumerate(relevant_docs[:3], 1):
+    print(f"📄 Result {i}:")
+    print(f"   Source: {doc.metadata.get('source', 'Unknown')}")
+    print(f"   Page: {doc.metadata.get('page', 'Unknown')}")
+    print(f"   Content: {doc.page_content[:300]}...")
+    print("-"*80 + "\n")
+""" Query database"""
+def query_private_database(query: str) -> str:
+    """
+    Query the private database of analyst reports and AI initiative documents.
+
+    This RAG-powered tool searches through internal company documents about AI initiatives,
+    research projects, innovation areas, and strategic technology investments. Use this tool
+    when you need information about:
+    - Company AI research projects and initiatives
+    - AI innovation areas and focus
+    - Technology roadmaps and future plans
+    - Specific AI project timelines and details
+
+    Args:
+        query: Natural language query about company AI initiatives
+               (e.g., "What AI projects is Microsoft working on?",
+                      "NVIDIA's AI research areas",
+                      "Amazon's AI timeline")
+
+    Returns:
+        str: Detailed answer based on private analyst reports with source citations
+
+    Example:
+        >>> result = query_private_database("What are Google's latest AI initiatives?")
+        >>> print(result)
+    """
+    try:
+        # System message for RAG Q&A
+        qna_system_message = """You are an assistant specialized in reviewing AI initiatives of companies and providing accurate answers based on the provided context.
+
+User input will include all the context you need to answer their question.
+This context will always begin with the token: ###Context.
+The context contains references to specific AI initiatives, projects, or programs of companies relevant to the user's query.
+
+User questions will begin with the token: ###Question.
+
+Answer only using the context provided. Do not add external information or mention the context in your answer.
+Always cite which company the information comes from.
+If the answer cannot be found in the context, respond with "I don't know - this information is not available in our analyst reports."
+"""
+
+        # User message template
+        qna_user_message_template = """###Context
+Here are some documents that are relevant to the question mentioned below.
+{context}
+
+###Question
+{question}
+"""
+
+        # Retrieve relevant document chunks
+        relevant_document_chunks = retriever.get_relevant_documents(query)
+        context_list = [d.page_content for d in relevant_document_chunks]
+        context_for_query = ". ".join(context_list)
+
+        # Build the full prompt
+        formatted_prompt = f"""[INST]{qna_system_message}
+
+                {'user'}: {qna_user_message_template.format(context=context_for_query, question=query)}
+                [/INST]"""
+
+        # Query the LLM
+        model =""" Querying"""
+
+        response = model.invoke(formatted_prompt)
+
+        return response.content
+
+    except Exception as e:
+        return f"Error querying private database: {str(e)}"
+
+print("✅ Tool 5: query_private_database() - Defined")
+print("   Purpose: Access private analyst reports via RAG")
+print("   Data Source: ChromaDB vector store")
+print("   Powered by: OpenAI embeddings + LLM generation")
+
+# Test the query_private_database tool
+test_queries = [
+    "What AI projects is Microsoft working on?",
+    "What are NVIDIA's AI research areas?",
+    "Tell me about Google's AI initiatives"
+]
+
+for test_query in test_queries:
+    print("="*80)
+    print(f"🔍 Query: {test_query}\n")
+    result = query_private_database.invoke({"query": test_query})
+    print(f"📄 Answer:\n{result}")
+    print("\n")
+
+AGENT_CHARTER_WITH_RAG = """You are an autonomous Financial Research Analyst Agent specializing in AI sector investments.
+
+════════════════════════════════════════════════════════════════════════════════
+PRIMARY MISSION
+════════════════════════════════════════════════════════════════════════════════
+
+Analyze public companies (especially AI-focused) to generate comprehensive, real-time
+investment research briefings that provide insights beyond simple data lookup.
+
+TARGET OUTPUT:
+A structured report covering:
+• Financial Health: Stock performance, 3-year trends, key metrics
+• Market Sentiment: News analysis with sentiment scores
+• AI Research Activity: Current AI projects and innovations (using private database)
+• Risk Assessment: Key risks and opportunities
+• Investment Recommendation: Data-driven rating with confidence level
+
+════════════════════════════════════════════════════════════════════════════════
+AVAILABLE TOOLS
+════════════════════════════════════════════════════════════════════════════════
+
+Stock Data Tools:
+• get_stock_price(ticker) - Current price, volume, market cap
+• get_stock_history(ticker, period) - Historical data (use '3y' for 3-year analysis)
+
+News & Sentiment Tools:
+• search_financial_news(query) - Real-time financial news search
+• analyze_sentiment(text) - Sentiment analysis with score
+
+Private Data Tools (NEW!):
+• query_private_database(query) - Query internal analyst reports about AI initiatives
+  Use this for: AI projects, research areas, innovation timelines, technology roadmaps
+
+════════════════════════════════════════════════════════════════════════════════
+PROACTIVE BEHAVIOR - Take Initiative
+════════════════════════════════════════════════════════════════════════════════
+
+✓ ALWAYS gather comprehensive data, not just what's explicitly requested
+✓ ALWAYS check 3-year historical performance, not just current price
+✓ ALWAYS analyze recent news sentiment, even if not asked
+✓ ALWAYS query private database for AI research activity
+✓ ALWAYS identify risks proactively, don't wait to be asked
+✓ ALWAYS make a clear recommendation with confidence level
+
+✗ NEVER stop at surface-level data
+✗ NEVER provide analysis without supporting evidence
+✗ NEVER ignore warning signs in the data
+✗ NEVER skip the AI research check
+
+════════════════════════════════════════════════════════════════════════════════
+REACTIVE BEHAVIOR - Error Handling & Adaptability
+════════════════════════════════════════════════════════════════════════════════
+
+When Tools Fail:
+• If a tool returns an error, IMMEDIATELY try an alternative approach
+• If stock data fails, explain the limitation and use news/company info instead
+• If news search fails, note this gap and continue with available data
+• If private database query fails, note the limitation in your report
+• NEVER stop your analysis due to a single tool failure
+• Log all errors but maintain momentum toward your goal
+
+When Data is Missing:
+• If you cannot get 3-year data, use whatever period is available and note it
+• If sentiment analysis fails, make qualitative assessment from news titles
+• If news is sparse, note this as a finding (low media coverage = risk/opportunity?)
+• If AI research data is unavailable, explicitly state this gap
+• ALWAYS work with what you have, document what you don't have
+
+════════════════════════════════════════════════════════════════════════════════
+AUTONOMOUS BEHAVIOR - Independence & Judgment
+════════════════════════════════════════════════════════════════════════════════
+
+Data Gaps & Transparency:
+• If you encounter missing data, EXPLICITLY state the gap in your report
+• Explain the impact of missing data on your analysis confidence
+• NEVER pretend to have data you don't have
+
+Source Citation (MANDATORY):
+• You MUST cite the source for every factual claim
+• Include timestamps for time-sensitive data (stock prices, news)
+• For private database queries, cite as [Source: Private Analyst Reports]
+• For news articles, you MUST include the article URL as a clickable link
+• Format: [Source: tool_name, timestamp] or [Source: Article Title (URL)]
+
+Example:
+✓ "AAPL is trading at $178.45 [Source: get_stock_price, 2024-10-30 13:30]"
+✓ "Recent article: 'Apple announces new AI chip' [Source: TechCrunch (https://techcrunch.com/...)]"
+✓ "Recent news shows positive sentiment (score: 0.75) [Source: analyze_sentiment]"
+✓ "Microsoft is working on Azure AI integration [Source: Private Analyst Reports]"
+✗ "The stock is doing well" (no source, no metrics)
+✗ "Recent positive news about Apple" (no article link or title)
+
+IMPORTANT for News Articles:
+• When citing news from search_financial_news, ALWAYS extract and include:
+  - Article title
+  - Article URL (as a clickable link)
+• Format: "According to '[Article Title]' [Source: Publication (URL)]"
+• Never cite news without providing the actual article link
+
+Confidence & Nuance:
+• Include confidence levels for predictions: High/Medium/Low
+• Acknowledge uncertainty: "Data suggests..." vs "Data confirms..."
+• Note when analysis is limited by data availability
+
+════════════════════════════════════════════════════════════════════════════════
+AI RESEARCH ACTIVITY CHECK (Section 2.2)
+════════════════════════════════════════════════════════════════════════════════
+
+For EVERY company analysis, you MUST:
+1. Query the private database for AI initiatives
+2. Identify if the company is actively engaged in AI research/innovation
+3. List the latest 3 areas of AI research or projects (if available)
+4. Include project timelines and details (if available)
+
+Example queries to private database:
+• "What AI projects is [COMPANY] working on?"
+• "What are [COMPANY]'s AI research areas?"
+• "[COMPANY] AI initiative timeline"
+
+════════════════════════════════════════════════════════════════════════════════
+QUALITY STANDARDS
+════════════════════════════════════════════════════════════════════════════════
+
+Every Report Must Include:
+1. Executive Summary (2-3 sentences)
+2. Financial Metrics (with sources and timestamps)
+3. Sentiment Analysis (with scores and article count)
+4. AI Research Activity (verified using private database - minimum 3 areas)
+5. Risk Factors (minimum 2-3 identified)
+6. Recommendation (Buy/Hold/Sell with confidence %)
+7. Source Citations (for all claims)
+8. Gaps & Limitations (what data was unavailable)
+
+Remember: You are AUTONOMOUS. Take initiative, handle errors gracefully, and
+always drive toward your goal of comprehensive investment analysis.
+Use ALL available tools, especially the private database for AI research insights.
+"""
+
+print("✅ Updated Agent Charter (with RAG tool)")
+print("   • Added query_private_database to available tools")
+print("   • Added AI Research Activity Check requirements")
+print("   • Enhanced quality standards")
+
+def create_enhanced_financial_agent(with_rag: bool = True, with_memory: bool = True):
+    """
+    Creates an enhanced financial research agent with RAG capabilities.
+
+    Args:
+        with_rag: Whether to include the query_private_database RAG tool
+        with_memory: Whether to enable conversation memory
+
+    Returns:
+        Compiled LangGraph agent with RAG capabilities
+    """
+    # Use RAG-enhanced charter
+    system_prompt = AGENT_CHARTER_WITH_RAG
+
+    # Collect all tools (now including RAG tool)
+    if with_rag:
+        tools = [
+            get_stock_price,
+            get_stock_history,
+            search_financial_news,
+            analyze_sentiment,
+            query_private_database  # NEW!
+        ]
+        logger.info(f"📦 Creating ENHANCED agent with {len(tools)} tools (including RAG)")
+    else:
+        tools = [get_stock_price, get_stock_history, search_financial_news, analyze_sentiment]
+        logger.info(f"📦 Creating agent with {len(tools)} tools (no RAG)")
+
+    logger.info(f"   Tools: {', '.join(t.name for t in tools)}")
+
+    # Initialize model with tools
+    model ="Creating model with a list of tools"
+    model_with_tools = model.bind_tools( """ Combining the model with tools """)
+
+    # Define agent node
+    def agent_node(state:SimpleAgentState) -> dict:
+        """Agent node that calls the LLM with system prompt and current state."""
+        logger.info("🤖 AGENT NODE: Processing request...")
+
+        # Prepare messages with system prompt
+        system_msg = SystemMessage(content=system_prompt)
+        messages = system_msg(state["messages"])
+
+        # Invoke model
+        logger.info("   Calling LLM with tools...")
+        response = model_with_tools.invoke(messages)
+
+        # Log if agent wants to use tools
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            logger.info(f"   ✓ Agent decided to use {len(response.tool_calls)} tool(s)")
+            for i, tool_call in enumerate(response.tool_calls, 1):
+                logger.info(f"      {i}. {tool_call['name']}")
+        else:
+            logger.info("   ✓ Agent generated final response (no tools needed)")
+
+        return {"messages": [response]}
+
+    # Define routing function
+    def should_continue(state: Tools) -> Literal["tools", "end"]:
+        """Determines whether to continue to tools or end."""
+        last_message = state["messages"][-1]
+
+        if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+            logger.info("🔀 ROUTING: Continuing to TOOLS node")
+            return "CONTINUE"
+
+
+        logger.info("🔀 ROUTING: Ending workflow (final response ready)")
+        return "END"
+
+    # Create workflow
+    workflow = StateGraph(SimpleAgentState)
+
+    # Create tool node with logging
+    original_tool_node = ToolNode(tools)
+
+    def tool_node_with_logging(state):
+        logger.info("🔧 TOOL NODE: Executing tools...")
+        result = original_tool_node.invoke(state)
+        logger.info(f"   ✓ Tools executed successfully")
+        return result
+
+    # Add nodes to graph
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", tool_node_with_logging)
+
+    # Set entry point
+    workflow.setEntryPoint("agent")
+
+    # Add conditional edge from agent
+    workflow.new_edge(
+        "agent",
+        should_continue,
+        {
+            "tools": "tools",
+            "end": END
+        }
+    )
+
+    # Add edge from tools back to agent
+    workflow.add_edge("tools", "agent")
+
+    # Compile graph
+    if with_memory:
+        logger.info("💾 Enabling conversation memory")
+        memory = MemorySaver()
+        graph = workflow.compile(checkpointer=memory)
+    else:
+        logger.info("⚠️  Memory disabled - stateless mode")
+        graph = workflow.compile()
+
+    logger.info("✅ Enhanced agent created successfully\n")
+    return graph
+
+print("✅ Enhanced agent creation function defined")
+print("   • Includes all 5 tools (stock, news, sentiment, RAG)")
+print("   • Uses updated charter with AI research requirements")
+
+print("="*80)
+print("TEST 5: Enhanced Agent with RAG - AI Research Activity Check")
+print("="*80 + "\n")
+
+# Create enhanced agent with RAG
+enhanced_agent = create_enhanced_financial_agent(with_rag=True, with_memory=True)
+
+# Test query that requires AI research information
+query = "Provide a comprehensive investment analysis for NVIDIA (NVDA) including their AI research initiatives"
+print(f"Query: {query}\n")
+print("-"*80 + "\n")
+
+# Run agent with memory
+config = {"configurable": {"thread_id": "enhanced_test_1"}}
+result = enhanced_agent.invoke(
+    {"messages": [HumanMessage(content=query)]},
+    config=config
+)
+
+print("\n🤖 ENHANCED AGENT RESPONSE (with RAG):")
+print("="*80)
+print(result["messages"][-1].content)
+print("\n" + "="*80)
+print("\n✅ Notice: The agent now includes:")
+print("   • AI research projects from private analyst reports")
+print("   • Specific AI initiative details")
+print("   • Integration of financial + AI research data")
+print("   • Comprehensive investment recommendation")
+
+print("="*80)
+print("TEST 6: Synergistic Tool Usage (News + Sentiment + RAG)")
+print("="*80 + "\n")
+
+query = "Analyze Microsoft's position in the AI market. Include recent news sentiment and their strategic AI initiatives."
+print(f"Query: {query}\n")
+print("-"*80 + "\n")
+
+config = {"configurable": {"thread_id": "synergy_test_1"}}
+result = enhanced_agent.invoke(
+    {"messages": [HumanMessage(content=query)]},
+    config=config
+)
+
+print("\n🤖 AGENT RESPONSE (Synergistic Tool Usage):")
+print("="*80)
+print(result["messages"][-1].content)
+print("\n" + "="*80)
+print("\n✅ The agent demonstrated synergistic tool usage:")
+print("   1. search_financial_news() - Found recent articles")
+print("   2. analyze_sentiment() - Analyzed news sentiment")
+print("   3. query_private_database() - Retrieved AI initiative details")
+print("   4. get_stock_history() - Got financial performance")
+print("   5. Synthesized all data into comprehensive report")
+
+requireprint("="*80)
+print("TEST 7: Investment Recommendation System - Multi-Company Ranking")
+print("="*80 + "\n")
+
+# Define companies to analyze
+companies = ["MSFT", "GOOGL", "NVDA", "AMZN", "IBM"]
+
+query = f"""
+
+<--- 🧩🧩🧩 Your Prompt Goes Here 🧩🧩🧩 --->
+
+Companies to analyze: {', '.join(companies)}
+
+<--- 🧩🧩🧩 Your Prompt Goes Here 🧩🧩🧩 --->
+
+
+"""
+
+print(f"Query: Multi-company investment ranking\n")
+print(f"Companies: {', '.join(companies)}\n")
+print("-"*80 + "\n")
+
+config = {"configurable": {"thread_id": "ranking_test_1"}}
+result = enhanced_agent.invoke(
+    {"messages": [HumanMessage(content=query)]},
+    config=config
+)
+
+print("\n🤖 INVESTMENT RANKING REPORT:")
+print("="*80)
+print(result["messages"][-1].content)
+print("\n" + "="*80)
+
+# Final Interactive Test Cell
+# Try your own custom queries here!
+
+custom_query = "Which company has the most innovative AI research among the analyzed companies? Provide detailed evidence from the private analyst reports."
+
+print("="*80)
+print("YOUR CUSTOM QUERY")
+print("="*80 + "\n")
+print(f"Query: {custom_query}\n")
+print("-"*80 + "\n")
+
+config = {"configurable": {"thread_id": "ranking_test_1"}}
+result = enhanced_agent.invoke(
+    {"messages": [HumanMessage(content=custom_query)]},
+    config=config
+)
+
+print("\n🤖 AGENT RESPONSE:")
+print("="*80)
+print(result["messages"][-1].content)
+print("\n" + "="*80)
+
