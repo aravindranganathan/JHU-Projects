@@ -1,0 +1,1402 @@
+# 📦 Install Dependencies
+# This will install all required packages for the mortgage underwriting system
+
+!pip install \
+  langgraph==1.1.9 \
+  langchain==1.2.15 \
+  langchain-openai==1.1.7 \
+  langchain-community==0.4.1 \
+  langchain-text-splitters==1.1.0 \
+  chromadb==1.4.0 \
+  pypdf==6.6.0
+
+print("✅ All packages installed successfully!")
+print("\n📚 Installed:")
+print("  - LangGraph (Agent orchestration)")
+print("  - LangChain (LLM workflows)")
+print("  - LangChain Text Splitters")
+print("  - ChromaDB (Vector storage)")
+print("  - OpenAI Integration")
+
+# 🔑 Configure GreatLearning API Keys
+# Using GreatLearning's OpenAI proxy service
+import os
+from google.colab import userdata
+from google.colab import drive
+
+# Load secrets from Colab
+os.environ["OPENAI_API_KEY"] = userdata.get("API_KEY")
+os.environ["OPENAI_API_BASE"] = userdata.get("OPENAI_API_BASE")
+print("✅ GreatLearning API configured via Colab Secrets!")
+print("Using API Base:", os.environ["OPENAI_API_BASE"])
+
+import json
+import re
+from typing import TypedDict, Annotated, List, Dict, Any, Optional
+from datetime import datetime
+
+# LangChain & LangGraph
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain.tools import tool
+
+# Vector Store for RAG
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+
+print("✅ All libraries imported successfully!")
+print("\n🎉 Environment setup complete! You're ready to build the system.")
+
+# 🏗️ Define Application State Schema
+
+class UnderwritingState(TypedDict):
+    """The complete state of a loan application as it moves through the system."""
+
+    # Application Information
+    case_id: str
+    applicant_data: Dict[str, Any]
+    sanitized_data: Dict[str, Any]
+
+    # Agent Analysis Results
+    credit_analysis: Optional[str]
+    income_analysis: Optional[str]
+    asset_analysis: Optional[str]
+    collateral_analysis: Optional[str]
+
+    # Coordination & Decision
+    critic_review: Optional[str]
+    decision_memo: Optional[str]
+    final_decision: Optional[str]  # APPROVED, DENIED, CONDITIONAL_APPROVAL
+    risk_score: Optional[int]  # 0-100
+
+    # Workflow Control
+    next_agent: Optional[str]
+    analysis_complete: bool
+    human_review_required: bool
+    human_review_completed: bool
+    human_notes: Optional[str]
+
+    # Compliance
+    bias_flags: List[str]
+    policy_violations: List[str]
+
+    # Audit Trail
+    reasoning_chain: Annotated[List[str], "append"]  # Accumulates all reasoning steps
+    timestamp: str
+
+print("✅ State schema defined!")
+print("\n📋 The state will track:")
+print("  - Application data (sanitized and raw)")
+print("  - All agent analyses")
+print("  - Decision and risk assessment")
+print("  - Compliance flags")
+print("  - Complete audit trail")
+
+# 🛠️ Utility Tools for Underwriting Calculations
+@tool
+def calculate_dti_ratio(monthly_debt: float, monthly_income: float) -> str:
+    """Calculate Debt-to-Income ratio.
+
+    Args:
+        monthly_debt: Total monthly debt obligations
+        monthly_income: Total monthly gross income
+
+    Returns:
+        Formatted DTI ratio result
+    """
+    if monthly_income <= 0:
+        return "Error: Monthly income must be greater than 0"
+
+    dti = (monthly_debt / monthly_income) * 100
+
+    result = {
+        "dti_ratio": round(dti, 2),
+        "monthly_debt": round(monthly_debt, 2),
+        "monthly_income": round(monthly_income, 2),
+        "status": "Acceptable" if dti <= 43 else "High" if dti <= 50 else "Excessive"
+    }
+
+    return f"DTI Ratio: {result['dti_ratio']}% ({result['status']}) - Debt: ${result['monthly_debt']:,.2f}, Income: ${result['monthly_income']:,.2f}"
+
+@tool
+def calculate_ltv_ratio(loan_amount: float, property_value: float) -> str:
+    """Calculate Loan-to-Value ratio.
+
+    Args:
+        loan_amount: The loan amount requested
+        property_value: Appraised value of the property
+
+    Returns:
+        Formatted LTV ratio result
+    """
+    if property_value <= 0:
+        return "Error: Property value must be greater than 0"
+
+    ltv = loan_amount/property_value *100
+
+    result = {
+        "ltv_ratio": round(ltv, 2),
+        "loan_amount": round(loan_amount, 2),
+        "property_value": round(property_value, 2),
+        "status": "Excellent" if ltv <= 80 else "Good" if ltv <= 90 else "High" if ltv <= 97 else "Excessive"
+    }
+
+    return f"LTV Ratio: {result['ltv_ratio']}% ({result['status']}) - Loan: ${result['loan_amount']:,.2f}, Value: ${result['property_value']:,.2f}"
+
+@tool
+def calculate_reserves(liquid_assets: float, monthly_payment: float, required_months: int = 2) -> str:
+    """Calculate reserve coverage in months.
+
+    Args:
+        liquid_assets: Total liquid assets available
+        monthly_payment: Monthly PITI payment
+        required_months: Number of months reserves required (default 2)
+
+    Returns:
+        Formatted reserves analysis
+    """
+    if monthly_payment <= 0:
+        return "Error: Monthly payment must be greater than 0"
+
+    months_coverage = liquid_assets / monthly_payment
+    required_amount = monthly_payment * required_months
+
+    result = {
+        "months_coverage": round(months_coverage, 1),
+        "liquid_assets": round(liquid_assets, 2),
+        "required_amount": round(required_amount, 2),
+        "surplus_deficit": round(liquid_assets - required_amount, 2),
+        "status": "Adequate" if months_coverage >= required_months else "Insufficient"
+    }
+
+    return f"Reserves: {result['months_coverage']} months coverage ({result['status']}) - Assets: ${result['liquid_assets']:,.2f}, Required: ${result['required_amount']:,.2f}"
+
+@tool
+def calculate_housing_expense_ratio(monthly_payment: float, monthly_income: float) -> str:
+    """Calculate housing expense ratio (front-end ratio).
+
+    Args:
+        monthly_payment: Monthly PITI payment
+        monthly_income: Total monthly gross income
+
+    Returns:
+        Formatted housing expense ratio
+    """
+    if monthly_income <= 0:
+        return "Error: Monthly income must be greater than 0"
+
+    ratio = (monthly_payment / monthly_income) * 100
+
+    result = {
+        "housing_ratio": round(ratio, 2),
+        "monthly_payment": round(monthly_payment, 2),
+        "monthly_income": round(monthly_income, 2),
+        "status": "Acceptable" if ratio <= 28 else "Elevated" if ratio <= 35 else "High"
+    }
+
+    return f"Housing Ratio: {result['housing_ratio']}% ({result['status']}) - Payment: ${result['monthly_payment']:,.2f}, Income: ${result['monthly_income']:,.2f}"
+
+@tool
+def check_credit_score_policy(credit_score: int) -> str:
+    """Check if credit score meets policy requirements.
+
+    Args:
+        credit_score: Borrower's credit score
+
+    Returns:
+        Policy compliance result
+    """
+    if credit_score >= 740:
+        tier = "Excellent"
+        rate_adjustment = "Best rates available"
+    elif credit_score >= 700:
+        tier = "Very Good"
+        rate_adjustment = "Favorable rates"
+    elif credit_score >= 660:
+        tier = "Good"
+        rate_adjustment = "Standard rates"
+    elif credit_score >= 620:
+        tier = "Fair"
+        rate_adjustment = "Higher rates, may require compensating factors"
+    else:
+        tier = "Below Minimum"
+        rate_adjustment = "Does not meet conventional loan requirements"
+
+    return f"Credit Score: {credit_score} - Tier: {tier} - {rate_adjustment}"
+
+@tool
+def check_large_deposits(deposits: list, monthly_income: float) -> str:
+    """Identify large deposits requiring sourcing documentation.
+
+    Args:
+        deposits: List of recent deposits [{'amount': float, 'date': str}, ...]
+        monthly_income: Monthly income for threshold calculation
+
+    Returns:
+        Analysis of deposits requiring documentation
+    """
+    threshold = monthly_income * 0.25  # 25% of monthly income
+    large_deposits = []
+
+    for deposit in deposits:
+        amount = deposit.get('amount', 0)
+        if amount >= threshold:
+            large_deposits.append({
+                'amount': amount,
+                'date': deposit.get('date', 'Unknown'),
+                'sourcing_required': True
+            })
+
+    if not large_deposits:
+        return f"No large deposits identified (threshold: ${threshold:,.2f}). All deposits are acceptable."
+
+    result = f"Found {len(large_deposits)} large deposit(s) requiring documentation (threshold: ${threshold:,.2f}):\n"
+    for i, dep in enumerate(large_deposits, 1):
+        result += f"  {i}. ${dep['amount']:,.2f} on {dep['date']} - Sourcing documentation required\n"
+
+    return result
+
+@tool
+def calculate_total_debt_obligations(debts: dict, proposed_payment: float) -> str:
+    """Calculate total monthly debt obligations including proposed loan.
+
+    Args:
+        debts: Dictionary of current debts {'debt_name': amount, ...}
+        proposed_payment: Proposed monthly loan payment
+
+    Returns:
+        Total debt calculation
+    """
+    current_debt = sum(debts.values())
+    total_obligation = current_debt + proposed_payment
+
+    result = {
+        "current_debt": round(current_debt, 2),
+        "proposed_payment": round(proposed_payment, 2),
+        "total_obligation": round(total_obligation, 2),
+        "debt_breakdown": {k: round(v, 2) for k, v in debts.items()}
+    }
+
+    breakdown = "\n".join([f"  - {k}: ${v:,.2f}" for k, v in result['debt_breakdown'].items()])
+
+    return f"Total Monthly Obligations: ${result['total_obligation']:,.2f}\nCurrent Debt: ${result['current_debt']:,.2f}\n{breakdown}\nProposed Payment: ${result['proposed_payment']:,.2f}"
+
+print("✅ Calculator tools created!")
+print("\nAvailable tools:")
+print("  • calculate_dti_ratio - DTI calculation")
+print("  • calculate_ltv_ratio - LTV calculation")
+print("  • calculate_reserves - Reserve coverage")
+print("  • calculate_housing_expense_ratio - Front-end ratio")
+print("  • check_credit_score_policy - Credit score tier")
+print("  • check_large_deposits - Deposit sourcing")
+print("  • calculate_total_debt_obligations - Total debt")
+
+# 🔒 PII Sanitization Functions
+
+def sanitize_pii(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove or redact personally identifiable information.
+
+    Args:
+        data: Raw application data
+
+    Returns:
+        Sanitized data safe for LLM processing
+    """
+    sanitized = data.copy()
+
+    # Redact SSN (keep last 4 digits)
+    if 'ssn' in sanitized:
+        ssn = sanitized['ssn']
+        sanitized['ssn'] = f"***-**-{ssn[-4:]}" if len(ssn) >= 4 else "***-**-XXXX"
+
+    # Replace full names with placeholders
+    if 'name' in sanitized:
+        sanitized['name'] = "[APPLICANT_NAME]"
+
+    # Redact addresses
+    if 'address' in sanitized:
+        sanitized['address'] = "[ADDRESS]"
+
+    # Mask phone numbers
+    if 'phone' in sanitized:
+        phone = sanitized['phone']
+        sanitized[phone] = f"***-***-{phone[-4:]}" if len(phone) >= 4 else "***-***-XXXX"
+
+    return sanitized
+
+def detect_bias_signals(analysis: str, applicant_data: Dict[str, Any]) -> List[str]:
+    """Check for potential Fair Lending Act violations.
+
+    Args:
+        analysis: Agent's analysis text
+        applicant_data: Applicant information
+
+    Returns:
+        List of detected bias flags
+    """
+    flags = []
+
+    # Protected characteristics that shouldn't influence decisions
+    protected_terms = [
+        'race', 'color', 'religion', 'national origin',
+        'sex', 'marital status', 'age', 'gender',
+        'disability', 'familial status'
+    ]
+
+    # Check if analysis mentions protected characteristics
+    analysis_lower = analysis.lower()
+    for term in protected_terms:
+        if term in protected_terms:
+            flags.append(f"Analysis mentions protected characteristic: {term}")
+
+    # Check for zip code-based discrimination
+    if 'zip' in applicant_data or 'zipcode' in applicant_data:
+        if 'neighborhood' in analysis_lower or 'area' in analysis_lower:
+            flags.append("Potential geographic bias - review for Fair Lending compliance")
+
+    return flags
+
+print("✅ PII sanitization system created!")
+print("\n🛡️ Protection features:")
+print("  - SSN redaction")
+print("  - Name replacement")
+print("  - Address masking")
+print("  - Phone number protection")
+print("  - Bias signal detection")
+
+drive.mount('/content/drive')
+
+def create_policy_store():
+    """Create vector store with underwriting policies (loaded from PDF).
+
+    Returns:
+        ChromaDB vector store for policy retrieval
+    """
+    file_path = "/content/drive/MyDrive/underwriting_policies.pdf" # Corrected path
+    # Load policies from PDF instead of hardcoded text
+    loader = PyPDFLoader(file_path)
+    document = loader.load()
+      # Hint : To pass underwriting_policies.pdf
+
+    # Split policies into chunks
+    text_splitter =  RecursiveCharacterTextSplitter(
+    chunk_size = 500,
+    chunk_overlap    = 100,
+    length_function = len,
+    is_separator_regex = False)    # Hint: RecursiveCharacterTextSplitter
+
+    policy_chunks = text_splitter.split_documents(document)
+
+    # Create embeddings and store in ChromaDB
+    embeddings = OpenAIEmbeddings(
+        base_url="https://aibe.mygreatlearning.com/openai/v1"
+    )
+
+    vectorstore = Chroma.from_documents(
+        documents=policy_chunks,
+        embedding=embeddings,
+        collection_name="underwriting_policies"
+    )
+
+    return vectorstore
+
+def retrieve_relevant_policies(query: str, vectorstore) -> str:
+    docs = vectorstore.similarity_search(query, k=6)
+
+    section_map = {}
+
+    for doc in docs:
+        text = doc.page_content.strip()
+
+        # Extract section heading like "2.3 Self-Employment Income"
+        match = re.match(r"^\d+\.\d+\s+[A-Za-z ].+", text)
+        section = match.group(0) if match else "OTHER"
+
+        if section not in section_map:
+            section_map[section] = text
+        else:
+            # append only new content
+            if text not in section_map[section]:
+                section_map[section] += "\n" + text
+
+    return "\n\n".join(section_map.values())
+
+# ✅ System initialization (unchanged usage)
+#print(f"Verifying Colab Secret 'API_KEY': {userdata.get('API_KEY')}")
+#print(f"Verifying Colab Secret 'OPENAI_API_BASE': {userdata.get('OPENAI_API_BASE')}")
+vectorstore = create_policy_store()
+
+print("✅ RAG policy system created!")
+print("\n📖 Policy coverage:")
+print("  - Credit guidelines")
+print("  - Income verification rules")
+print("  - Asset requirements")
+print("  - Collateral standards")
+
+test_query = "What are the income verification requirements for self-employed borrowers?"
+
+retrieved_policies = retrieve_relevant_policies(
+    query=test_query,
+    vectorstore=vectorstore
+)
+
+print(f"Test Query: {test_query}")
+print("\nRetrieved relevant policy text:\n")
+print(retrieved_policies[:1000], "...\n")  # truncate for readability
+
+# 🧪 Test Case Data - Loaded from JSON
+
+# Load comprehensive test cases from JSON file
+print("📁 Loading test cases from mortgage_test_cases.json...")
+file_path = "/content/drive/MyDrive/" # Corrected path
+    # Load policies from PDF instead of hardcoded text
+    loader = PyPDFLoader(file_path)
+    document = loader.load()
+
+# Extract the three test cases
+test_case_1 = test_data['test_cases'][0]  # Strong Approval - Sarah Johnson
+test_case_2 = test_data['test_cases'][1]  # Marginal - Michael Chen
+test_case_3 = test_data['test_cases'][2]  # Denial - Robert Martinez
+
+print("✅ Test cases loaded successfully!\n")
+print("🧪 Test Case Summary:")
+print(f"  1. {test_case_1['case_id']}: {test_case_1['name']}")
+print(f"     - Credit Score: {test_case_1['credit_score']}")
+print(f"     - DTI Ratio: {test_case_1['dti_ratio']:.1%}")
+print(f"     - Expected: {test_case_1['expected_decision']}\n")
+
+print(f"  2. {test_case_2['case_id']}: {test_case_2['name']}")
+print(f"     - Credit Score: {test_case_2['credit_score']}")
+print(f"     - DTI Ratio: {test_case_2['dti_ratio']:.1%}")
+print(f"     - Expected: {test_case_2['expected_decision']}\n")
+
+print(f"  3. {test_case_3['case_id']}: {test_case_3['name']}")
+print(f"     - Credit Score: {test_case_3['credit_score']}")
+print(f"     - DTI Ratio: {test_case_3['dti_ratio']:.1%}")
+print(f"     - Expected: {test_case_3['expected_decision']}\n")
+
+print("📊 All test cases include comprehensive PII data:")
+print("   ✓ Full names, SSN, email, phone, address")
+print("   ✓ Detailed credit history with notes")
+print("   ✓ Employment history and income details")
+print("   ✓ Asset verification with deposit explanations")
+print("   ✓ Property condition and repair requirements")
+
+# 🧠 Initialize Language Model with GreatLearning API
+
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,  # Deterministic for consistency
+    base_url="https://aibe.mygreatlearning.com/openai/v1",  # GreatLearning API endpoint
+)
+
+# Create the policy store
+policy_store = create_policy_store()
+
+print("✅ LLM initialized with GreatLearning API!")
+print("✅ Policy store created!")
+
+# 🎯 Helper Functions for Agent Testing
+
+def initialize_application(state: UnderwritingState) -> UnderwritingState:
+    """
+    Initialize a new application with sanitized data.
+    """
+    # Sanitize PII
+    sanitized = sanitize_pii(state["applicant_data"])
+
+    return {
+        **state,
+        "sanitized_data": sanitized,
+        "analysis_complete": False,
+        "human_review_required": False,
+        "human_review_completed": False,
+        "bias_flags": [],
+        "policy_violations": [],
+        "reasoning_chain": [f"Application {state.get('case_id')} initialized"],
+        "timestamp": datetime.now().isoformat()
+    }
+
+def sanitize_pii_node(state: UnderwritingState) -> UnderwritingState:
+    """
+    Node wrapper for PII sanitization.
+    """
+    return state
+
+print("✅ Helper functions for agent testing created!")
+
+# @title 1.💳 Credit Analyst Agent Implementation
+
+def credit_analyst_node(state: UnderwritingState) -> UnderwritingState:
+    """
+    Analyzes borrower's credit profile and payment history.
+
+    Evaluates:
+    - Credit score quality
+    - Payment history
+    - Derogatory items (bankruptcies, foreclosures, collections)
+    - Overall creditworthiness
+    """
+    # Retrieve relevant credit policies
+    policies = retrieve_relevant_policies(
+        "credit score requirements bankruptcies foreclosures late payments",
+        policy_store
+    )
+
+    # Get sanitized application data
+    app_data = state["sanitized_data"]
+
+    # Use calculator tool for credit score assessment
+    credit_score = app_data.get('credit_score', 0)
+    credit_score_analysis = check_credit_score_policy.invoke({"credit_score": credit_score})
+
+    # Build analysis prompt
+    system_prompt = f"""
+You are a Senior Credit Analyst with 15+ years of experience in mortgage underwriting.
+
+RELEVANT POLICIES:
+{policies}
+
+Your task is to analyze the borrower's credit profile and provide a detailed assessment.
+
+ANALYSIS FRAMEWORK:
+1. Credit Score Assessment - Use provided assessment (DO NOT recalculate)
+2. Payment History - Review late payments and patterns
+3. Derogatory Items - Evaluate bankruptcies, foreclosures, collections
+4. Policy Compliance - Check against credit guidelines
+5. Risk Rating - Assign credit risk (Low/Medium/High)
+6. Recommendations - Provide conditions or concerns
+
+Be thorough, objective, and policy-compliant. Support conclusions with data.
+IMPORTANT: Use the EXACT credit score assessment provided below. Do not recalculate.
+"""
+
+    user_prompt = f"""
+Analyze the credit profile for case {app_data.get('case_id')}:
+
+CALCULATED CREDIT SCORE ASSESSMENT (ACCURATE - DO NOT RECALCULATE):
+{credit_score_analysis}
+
+CREDIT HISTORY DATA:
+- Bankruptcies: {app_data.get('credit_history', {}).get('bankruptcies', 0)}
+- Foreclosures: {app_data.get('credit_history', {}).get('foreclosures', 0)}
+- Late Payments (12mo): {app_data.get('credit_history', {}).get('late_payments_12mo', 0)}
+- Collections: {app_data.get('credit_history', {}).get('collections', [])}
+
+Provide your detailed credit analysis based on the ACCURATE assessment above.
+"""
+
+    # Generate analysis using llm directly
+    response = llm.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ])
+
+    # Extract analysis text
+    analysis = response.content
+
+    # Check for bias signals
+    bias_flags = detect_bias_signals(analysis, app_data)
+
+    # Update state
+    return {
+        **state,
+        "credit_analysis": analysis,
+        "bias_flags": state.get("bias_flags", []) + bias_flags,
+        "reasoning_chain": state.get("reasoning_chain", []) +
+            [f"Credit Analyst: Completed credit analysis for {app_data.get('case_id')}"]
+    }
+
+print("✅ Credit Analyst Agent created!")
+
+# @title 🧪 Test Case 01 - Credit Analyst Workflow
+
+print("="*80)
+print("TEST CASE 01: CREDIT ANALYST - Workflow Demonstration")
+print("="*80)
+print()
+
+print("📋 OBJECTIVE: Demonstrate Credit Analyst's responsibilities and analysis")
+print()
+
+# Create a minimal workflow with just Credit Analyst
+
+# Initialize state ONCE
+initial_inputs = {
+    "case_id": test_case_1["case_id"],
+    "applicant_data": test_case_1,
+    "sanitized_data": {},
+    "credit_analysis": None,
+    "income_analysis": None,
+    "asset_analysis": None,
+    "collateral_analysis": None,
+    "critic_review": None,
+    "decision_memo": None,
+    "final_decision": None,
+    "risk_score": None,
+    "next_agent": None,
+    "analysis_complete": False,
+    "human_review_required": False,
+    "human_review_completed": False,
+    "human_notes": None,
+    "bias_flags": [],
+    "policy_violations": [],
+    "reasoning_chain": [],
+    "timestamp": datetime.now().isoformat()
+}
+
+# Run initialization
+TC_01_state_0 = initialize_application(initial_inputs)
+TC_01_state_0 = sanitize_pii_node(TC_01_state_0)
+
+# Run Credit Analyst
+TC_01_state_1 = credit_analyst_node(TC_01_state_0)
+
+# Use TC_01_state_1 instead of result
+result = TC_01_state_1
+
+# Execute
+
+print("="*80)
+print("📊 CREDIT ANALYST RESULTS")
+print("="*80)
+print()
+
+print("📌 Case ID:", result.get("case_id"))
+print()
+
+print("💳 CREDIT ANALYSIS:")
+print("-" * 80)
+print(result.get("credit_analysis", "No analysis generated"))
+print()
+
+print("🚩 Bias Flags:", len(result.get("bias_flags", [])))
+if result.get("bias_flags"):
+    for flag in result.get("bias_flags", []):
+        print(f"   ⚠️ {flag}")
+print()
+
+print("🔍 Reasoning Chain:")
+for step in result.get("reasoning_chain", []):
+    print(f"   → {step}")
+print()
+
+print("="*80)
+print("✅ Credit Analyst Test Complete!")
+print("="*80)
+print()
+print("🎓 LEARNER NOTE:")
+print("   The Credit Analyst evaluates:")
+print("   • Credit score quality and history")
+print("   • Payment patterns and derogatory items")
+print("   • Compliance with lending policies")
+print("   • Risk rating for creditworthiness")
+print()
+
+# @title 2.💵 Income Analyst Agent Implementation
+def income_analyst_node(state: UnderwritingState) -> UnderwritingState:
+    """
+    Analyzes borrower's income stability and capacity to repay.
+
+    Evaluates:
+    - Employment history and stability
+    - Income sources and verification
+    - Debt-to-Income ratio
+    - Capacity for monthly payment
+    """
+    # Retrieve income policies
+    policies = retrieve_relevant_policies(
+        "employment income verification DTI ratio self-employed",
+        policy_store
+    )
+
+    app_data = state["sanitized_data"]
+
+    # Use calculator tools for accurate calculations
+    debts = app_data.get('debts', {})
+    proposed_payment = app_data.get('loan', {}).get('estimated_payment', 0)
+    monthly_income = app_data.get('employment', {}).get('monthly_income', 0)
+
+    # Calculate using tools (eliminates hallucinations)
+    total_debt = sum(debts.values())
+    dti_result = calculate_dti_ratio.invoke({
+        "monthly_debt": total_debt + proposed_payment,
+        "monthly_income": monthly_income
+    })
+
+    housing_ratio_result = calculate_housing_expense_ratio.invoke({
+        "monthly_payment": proposed_payment,
+        "monthly_income": monthly_income
+    })
+
+    debt_breakdown = calculate_total_debt_obligations.invoke({
+        "debts": debts,
+        "proposed_payment": proposed_payment
+    })
+
+    system_prompt = f"""
+
+You are a Senior Income Analyst with 15+ years of experience in mortgage underwriting.
+
+RELEVANT POLICIES:
+{policies}
+
+Your task is to analyze the borrower's income stability and capacity to repay and give a detailed explanation.
+
+ANALYSIS FRAMEWORK:
+1.Employment Stability: Review job history and tenure (only for self-employed)
+2.Income Sources and Verification: Validate income sources available
+3.Debt to Income Ratio (DTI): Use provided recalculation (DO NOT recalculate)
+4.Capacity for Monthly Payment: Assess affordability
+5.Risk Assessment: Identify income risks if applicable
+6.Recommendations: Provide conditions if necessary
+IMPORTANT: Use the EXACT DTI ratio provided below. Do not recalculate.
+Be thorough, objective, and policy-compliant. Support conclusions with data.
+IMPORTANT: Use the EXACT income profile assessment provided below. Do not recalculate.
+"""
+
+    user_prompt = f"""
+
+Analyze the income profile for case {app_data.get('case_id')}:
+
+CALCULATED DTI RATIO (ACCURATE - DO NOT RECALCULATE):
+{dti_result}
+
+CALCULATED HOUSING EXPENSE RATIO (ACCURATE - DO NOT RECALCULATE):
+{housing_ratio_result}
+
+TOTAL DEBT AND OBLIGATIONS (ACCURATE - DO NOT RECALCULATE):
+{debt_breakdown}
+
+Employment_Data: {app_data.get('employment', {})}
+
+TOTAL DEBT AND OBLIGATIONS:
+{debt_breakdown}
+
+Monthly Income: ${monthly_income:,.2f}
+Monthly Debt: {total_debt}
+Proposed Payment: ${proposed_payment:,.2f}
+Provide your detailed income analysis based on the ACCURATE assessment above.
+
+"""
+
+# Generate analysis using llm directly
+    response = llm.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ])
+
+    analysis = response.content
+    bias_flags = detect_bias_signals(analysis, app_data)
+
+    return {
+        **state,
+        "income_analysis": analysis,
+        "bias_flags": state.get("bias_flags", []) + bias_flags,
+        "reasoning_chain": state.get("reasoning_chain", []) +
+            [f"Income Analyst: Completed income analysis with DTI calculation"]
+    }
+
+print("✅ Income Analyst Agent created!")
+
+# @title 🧪 Test Case 01 - Income Analyst Workflow
+
+print("="*80)
+print("TEST CASE 01: INCOME ANALYST - Workflow Demonstration")
+print("="*80)
+print()
+
+print("📋 OBJECTIVE: Demonstrate Income Analyst's DTI calculation and income verification")
+print()
+
+# Create workflow with Credit and Income Analysts
+
+# Use state from previous agent (Credit Analyst)
+TC_01_state_2 = income_analyst_node(TC_01_state_1)
+
+# Use TC_01_state_2 instead of result
+result = TC_01_state_2
+
+print("="*80)
+print("📊 INCOME ANALYST RESULTS")
+print("="*80)
+print()
+
+print("📌 Case ID:", result.get("case_id"))
+print()
+
+# Show income-specific details
+app_data = test_case_1
+debts = app_data.get('debts', {})
+total_debt = sum(debts.values())
+monthly_income = app_data.get('employment', {}).get('monthly_income', 0)
+proposed_payment = app_data.get('loan', {}).get('estimated_payment', 0)
+
+print("💵 INCOME DATA:")
+print(f"   • Monthly Income: ${monthly_income:,.2f}")
+print(f"   • Current Debt: ${total_debt:,.2f}")
+print(f"   • Proposed Payment: ${proposed_payment:,.2f}")
+print(f"   • DTI Ratio: {((total_debt + proposed_payment) / monthly_income * 100):.2f}%")
+print()
+
+print("💵 INCOME ANALYSIS:")
+print("-" * 80)
+print(result.get("income_analysis", "No analysis generated"))
+print()
+
+print("🔍 Reasoning Chain:")
+for step in result.get("reasoning_chain", []):
+    if "Income" in step:
+        print(f"   → {step}")
+print()
+
+print("="*80)
+print("✅ Income Analyst Test Complete!")
+print("="*80)
+print()
+print("🎓 LEARNER NOTE:")
+print("   The Income Analyst evaluates:")
+print("   • Employment stability and tenure")
+print("   • Income verification and sources")
+print("   • Debt-to-Income (DTI) ratio calculation")
+print("   • Capacity to afford monthly payments")
+print()
+
+# @title 3.💰 Asset Analyst Agent Implementation
+
+def asset_analyst_node(state: UnderwritingState) -> UnderwritingState:
+    """
+    Analyzes borrower's assets and reserves.
+
+    Evaluates:
+    - Down payment source and adequacy
+    - Reserve funds for emergencies
+    - Large deposit sourcing
+    - Asset documentation
+    """
+    policies = retrieve_relevant_policies(
+        "down payment reserves assets large deposits gift funds",
+        policy_store
+    )
+
+    app_data = state["sanitized_data"]
+    assets = app_data.get('assets', {})
+    loan = app_data.get('loan', {})
+    monthly_income = app_data.get('employment', {}).get('monthly_income', 0)
+
+    # Use calculator tools for accurate calculations
+    liquid_assets = assets.get('checking', 0) + assets.get('savings', 0)
+    monthly_payment = loan.get('estimated_payment', 0)
+
+    reserves_result = calculate_reserves.invoke({
+        "reserves": assets.get('reserves', []),
+        "liquid_assets": liquid_assets,
+        "monthly_payment": monthly_payment
+    })
+
+    deposits_result = check_large_deposits.invoke({
+        "deposits": assets.get('recent_deposits', []),
+        "monthly_income": monthly_income
+    })
+
+    system_prompt = f"""
+You are a Senior Asset Analyst with 15+ years of experience in mortgage underwriting.
+
+RELEVANT POLICIES:
+{policies}
+
+Your task is to analyze the borrower's assets and reserves and provide a detailed assessment.
+
+ANALYSIS FRAMEWORK:
+1.Employment Stability: Review job history and tenure (only for self-employed)
+2.Income Sources and Verification: Validate income sources available
+3.Debt to Income Ratio (DTI): Use provided recalculation (DO NOT recalculate)
+4.Capacity for Monthly Payment: Assess affordability
+5.Risk Assessment: Identify income risks if applicable
+6.Recommendations: Provide conditions if necessary
+IMPORTANT: Use the EXACT DTI ratio provided below. Do not recalculate.
+Be thorough, objective, and policy-compliant. Support conclusions with data.
+IMPORTANT: Use the EXACT income profile assessment provided below. Do not recalculate.
+
+"""
+
+    user_prompt = f"""
+Analyze the asset profile for case {app_data.get('case_id')}:
+
+CALCULATED HOUSING EXPENSE RATIO (ACCURATE - DO NOT RECALCULATE):
+{housing_ratio_result}
+
+TOTAL DEBT AND OBLIGATIONS (ACCURATE - DO NOT RECALCULATE):
+{debt_breakdown}
+
+Employment_Data: {app_data.get('employment', {})}
+
+TOTAL DEBT AND OBLIGATIONS:
+{debt_breakdown}
+
+Monthly Income: ${monthly_income:,.2f}
+Monthly Debt: {total_debt}
+Proposed Payment: ${proposed_payment:,.2f}
+Provide your detailed asset analysis based on the ACCURATE assessment above.
+
+
+"""
+
+# Generate analysis using llm directly
+    response = llm.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ])
+
+    analysis = response.content
+    bias_flags = detect_bias_signals(analysis, app_data)
+
+    return {
+        **state,
+        "asset_analysis": analysis,
+        "bias_flags": state.get("bias_flags", []) + bias_flags,
+        "reasoning_chain": state.get("reasoning_chain", []) +
+            [f"Asset Analyst: Completed asset analysis and deposit review"]
+    }
+
+print("✅ Asset Analyst Agent created!")
+
+# @title 🧪 Test Case 01 - Asset Analyst Workflow
+
+print("="*80)
+print("TEST CASE 01: ASSET ANALYST - Workflow Demonstration")
+print("="*80)
+print()
+
+print("📋 OBJECTIVE: Demonstrate Asset Analyst's fund verification and deposit analysis")
+print()
+
+# Create workflow through Asset Analyst
+
+# Use state from previous agent (Income Analyst)
+TC_01_state_3 = asset_analyst_node(TC_01_state_2)
+
+# Use TC_01_state_3 instead of result
+result = TC_01_state_3
+
+print("="*80)
+print("📊 ASSET ANALYST RESULTS")
+print("="*80)
+print()
+
+print("📌 Case ID:", result.get("case_id"))
+print()
+
+# Show asset-specific details
+assets = test_case_1.get('assets', {})
+loan = test_case_1.get('loan', {})
+total_liquid = assets.get('checking', 0) + assets.get('savings', 0)
+
+print("💰 ASSET DATA:")
+print(f"   • Liquid Assets: ${total_liquid:,.2f}")
+print(f"   • Required Down Payment: ${loan.get('down_payment', 0):,.2f}")
+print(f"   • Coverage: {(total_liquid / loan.get('down_payment', 1) * 100):.1f}%")
+print()
+
+print("💰 ASSET ANALYSIS:")
+print("-" * 80)
+print(result.get("asset_analysis", "No analysis generated"))
+print()
+
+print("🔍 Reasoning Chain:")
+for step in result.get("reasoning_chain", []):
+    if "Asset" in step:
+        print(f"   → {step}")
+print()
+
+print("="*80)
+print("✅ Asset Analyst Test Complete!")
+print("="*80)
+print()
+print("🎓 LEARNER NOTE:")
+print("   The Asset Analyst evaluates:")
+print("   • Down payment adequacy and sourcing")
+print("   • Reserve funds for emergencies")
+print("   • Large deposit verification")
+print("   • Asset documentation requirements")
+print()
+
+# @title 4.🏠 Collateral Analyst Agent Implementation
+
+def collateral_analyst_node (state: UnderwritingState) -> UnderwritingState:
+    """
+    Analyzes property value and condition.
+
+    Evaluates:
+    - Property appraisal and value
+    - Loan-to-Value ratio
+    - Property condition and habitability
+    - Collateral adequacy
+    """
+    policies = retrieve_relevant_policies(
+        "appraisal property condition LTV collateral",
+        policy_store
+    )
+
+    app_data = state["sanitized_data"]
+    property_data = app_data.get('property', {})
+    loan = app_data.get('loan', {})
+
+    # Use calculator tool for accurate LTV calculation
+    loan_amount = loan.get('amount', 0)
+    appraised_value = property_data.get('appraised_value', 0)
+
+    ltv_result = calculate_ltv_ratio.invoke({
+        "loan_amount": loan_amount,
+        "property_value": appraised_value
+    })
+
+    system_prompt = f"""
+You are a Senior Collateral Analyst with expertise in property valuation.
+
+RELEVANT POLICIES:
+{policies}
+
+Your task is to assess the property as collateral for the loan.
+
+ANALYSIS FRAMEWORK:
+1. Appraisal Review - Validate property value
+2. LTV Calculation - Use provided calculation (DO NOT recalculate)
+3. Property Condition - Evaluate habitability
+4. Marketability - Consider market factors
+5. Risk Assessment - Identify collateral risks
+6. Recommendations - Note any concerns
+
+IMPORTANT: Use the EXACT LTV calculation provided below. Do not recalculate.
+"""
+
+    user_prompt = f"""
+Analyze property collateral for case {app_data.get('case_id')}:
+
+PROPERTY:
+- Type: {property_data.get('type')}
+- Appraised Value: ${appraised_value:,.2f}
+- Condition: {property_data.get('condition')}
+- Use: {loan.get('use')}
+
+LOAN:
+- Loan Amount: ${loan_amount:,.2f}
+- Down Payment: ${loan.get('down_payment', 0):,.2f}
+
+CALCULATED LTV (ACCURATE - DO NOT RECALCULATE):
+{ltv_result}
+
+Provide your collateral analysis based on this ACCURATE calculation.
+"""
+
+    # Generate analysis using llm directly
+    response = llm.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ])
+
+    analysis = response.content
+    bias_flags = detect_bias_signals(analysis, app_data)
+
+    return {
+        **state,
+        "collateral_analysis": analysis,
+        "bias_flags": state.get("bias_flags", []) + bias_flags,
+        "reasoning_chain": state.get("reasoning_chain", []) +
+            [f"Collateral Analyst: Completed property analysis (LTV from tool)"]
+    }
+
+print("✅ Collateral Analyst Agent created!")
+
+# @title 🧪 Test Case 01 - Collateral Analyst Workflow
+
+print("="*80)
+print("TEST CASE 01: COLLATERAL ANALYST - Workflow Demonstration")
+print("="*80)
+print()
+
+print("📋 OBJECTIVE: Demonstrate Collateral Analyst's property evaluation and LTV calculation")
+print()
+
+# Create workflow through Collateral Analyst
+
+# Use state from previous agent (Asset Analyst)
+TC_01_state_4 = collateral_analyst_node(TC_01_state_3)
+
+# Use TC_01_state_4 instead of result
+result = TC_01_state_4
+
+print("="*80)
+print("📊 COLLATERAL ANALYST RESULTS")
+print("="*80)
+print()
+
+print("📌 Case ID:", result.get("case_id"))
+print()
+
+# Show property-specific details
+property_data = test_case_1.get('property', {})
+loan = test_case_1.get('loan', {})
+loan_amount = loan.get('amount', 0)
+appraised_value = property_data.get('appraised_value', 0)
+ltv = (loan_amount / appraised_value * 100) if appraised_value > 0 else 0
+
+print("🏠 PROPERTY DATA:")
+print(f"   • Appraised Value: ${appraised_value:,.2f}")
+print(f"   • Loan Amount: ${loan_amount:,.2f}")
+print(f"   • LTV Ratio: {ltv:.2f}%")
+print(f"   • Property Condition: {property_data.get('condition')}")
+print()
+
+print("🏠 COLLATERAL ANALYSIS:")
+print("-" * 80)
+print(result.get("collateral_analysis", "No analysis generated"))
+print()
+
+print("🔍 Reasoning Chain:")
+for step in result.get("reasoning_chain", []):
+    if "Collateral" in step:
+        print(f"   → {step}")
+print()
+
+print("="*80)
+print("✅ Collateral Analyst Test Complete!")
+print("="*80)
+print()
+print("🎓 LEARNER NOTE:")
+print("   The Collateral Analyst evaluates:")
+print("   • Property appraisal and value")
+print("   • Loan-to-Value (LTV) ratio")
+print("   • Property condition and habitability")
+print("   • Collateral adequacy for the loan")
+print()
+
+# @title 5.🔎 Critic Agent Implementation
+
+def critic_agent_node (state: UnderwritingState) -> UnderwritingState:
+    """
+    Reviews all specialist analyses for consistency and completeness.
+
+    Checks:
+    - All analyses are complete
+    - No contradictions between analysts
+    - Policy compliance across all areas
+    - Identifies gaps or concerns
+    """
+    system_prompt = """
+You are a Quality Assurance Critic reviewing underwriting analyses.
+
+Your role is to:
+1. Verify all analyses are complete and thorough
+2. Identify any contradictions or inconsistencies
+3. Ensure policy compliance
+4. Flag any missing information
+5. Provide a synthesis of key findings
+
+Be critical but fair. Focus on ensuring decision quality.
+"""
+
+    user_prompt = f"""
+Review all analyses for case {state.get('case_id')}:
+
+CREDIT ANALYSIS:
+{state.get('credit_analysis', 'Not completed')}
+
+INCOME ANALYSIS:
+{state.get('income_analysis', 'Not completed')}
+
+ASSET ANALYSIS:
+{state.get('asset_analysis', 'Not completed')}
+
+COLLATERAL ANALYSIS:
+{state.get('collateral_analysis', 'Not completed')}
+
+BIAS FLAGS:
+{state.get('bias_flags', [])}
+
+Provide your critical review and synthesis.
+"""
+
+    # Generate review using llm directly
+    response = llm.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ])
+
+    return {
+        **state,
+        "critic_review": response.content,
+        "reasoning_chain": state.get("reasoning_chain", []) +
+            ["Critic: Completed review of all specialist analyses"]
+    }
+
+print("✅ Critic Agent created!")
+
+# @title 🧪 Test Case 01 - Critic Agent Workflow
+
+print("="*80)
+print("TEST CASE 01: CRITIC AGENT - Workflow Demonstration")
+print("="*80)
+print()
+
+print("📋 OBJECTIVE: Demonstrate Critic Agent's quality assurance and synthesis")
+print()
+
+# Create workflow through Critic Agent
+
+# Use state from previous agent (Collateral Analyst)
+TC_01_state_5 = critic_agent_node(TC_01_state_4)
+
+# Use TC_01_state_5 instead of result
+result = TC_01_state_5
+
+print("="*80)
+print("📊 CRITIC AGENT RESULTS")
+print("="*80)
+print()
+
+print("📌 Case ID:", result.get("case_id"))
+print()
+
+print("🔎 CRITIC REVIEW:")
+print("-" * 80)
+print(result.get("critic_review", "No review generated"))
+print()
+
+print("📋 ANALYSES REVIEWED:")
+print(f"   • Credit Analysis: {'✅ Complete' if result.get('credit_analysis') else '❌ Missing'}")
+print(f"   • Income Analysis: {'✅ Complete' if result.get('income_analysis') else '❌ Missing'}")
+print(f"   • Asset Analysis: {'✅ Complete' if result.get('asset_analysis') else '❌ Missing'}")
+print(f"   • Collateral Analysis: {'✅ Complete' if result.get('collateral_analysis') else '❌ Missing'}")
+print()
+
+print("🚩 Bias Flags Found:", len(result.get("bias_flags", [])))
+print()
+
+print("🔍 Reasoning Chain:")
+for step in result.get("reasoning_chain", []):
+    if "Critic" in step:
+        print(f"   → {step}")
+print()
+
+print("="*80)
+print("✅ Critic Agent Test Complete!")
+print("="*80)
+print()
+print("🎓 LEARNER NOTE:")
+print("   The Critic Agent ensures:")
+print("   • All specialist analyses are complete")
+print("   • No contradictions between analysts")
+print("   • Policy compliance across all areas")
+print("   • Quality assurance before final decision")
+print()
+
+# @title 6.⚖️ Decision Agent Implementation
+
+def decision_agent_node (state: UnderwritingState) -> UnderwritingState:
+    """
+    Synthesizes all findings into a final decision and credit memo.
+
+    Determines:
+    - Final decision (APPROVED, DENIED, CONDITIONAL_APPROVAL)
+    - Risk score (0-100)
+    - Conditions if conditional approval
+    - Generates audit-ready credit memo
+    """
+
+
+    system_prompt = """
+You are the Senior Underwriting Decision Agent. Your task is to make a final decision on a loan application based on all available analyses.
+
+Instructions:
+1. Review the summaries from the Credit, Income, Asset, and Collateral Analysts.
+2. Consider the Critic's review for any inconsistencies or flags.
+3. Evaluate any compliance alerts (bias flags, policy violations).
+4. Assign a RISK_SCORE from 0-100 (0 being no risk, 100 being extreme risk).
+5. Determine the FINAL_DECISION: 'APPROVED', 'DENIED', or 'CONDITIONAL_APPROVAL'.
+6. If 'CONDITIONAL_APPROVAL', clearly state the conditions required.
+7. Generate a comprehensive CREDIT_MEMO explaining the decision, summarizing the key factors, and outlining any conditions.
+8. Be objective, thorough, and ensure the decision is well-justified based on the provided information.
+
+Respond in the following format:
+RISK_SCORE: [0-100]
+DECISION: [APPROVED/DENIED/CONDITIONAL_APPROVAL]
+CREDIT_MEMO: [Your detailed credit memo here]
+"""
+
+    user_prompt = f"""
+Make final underwriting decision for case {state.get('case_id')}:
+
+CREDIT ANALYSIS SUMMARY:
+{state.get('credit_analysis', 'N/A')[:500]}...
+
+INCOME ANALYSIS SUMMARY:
+{state.get('income_analysis', 'N/A')[:500]}...
+
+ASSET ANALYSIS SUMMARY:
+{state.get('asset_analysis', 'N/A')[:500]}...
+
+COLLATERAL ANALYSIS SUMMARY:
+{state.get('collateral_analysis', 'N/A')[:500]}...
+
+CRITIC REVIEW:
+{state.get('critic_review', 'N/A')[:500]}...
+
+COMPLIANCE ALERTS:
+- Bias Flags: {len(state.get('bias_flags', []))}
+- Policy Violations: {len(state.get('policy_violations', []))}
+
+Provide:
+1. RISK_SCORE: (number 0-100)
+2. DECISION: (APPROVED/DENIED/CONDITIONAL_APPROVAL)
+3. CREDIT_MEMO: (comprehensive decision documentation)
+"""
+
+    # Generate decision using llm directly
+    response = llm.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ])
+
+    # Parse response for risk score and decision
+    content = response.content
+
+    # Extract risk score
+    risk_score = 50  # default
+    if "RISK_SCORE:" in content:
+        import re
+        match = re.search(r'RISK_SCORE:\s*(\d+)', content)
+        if match:
+            risk_score = int(match.group(1))
+
+    # Extract decision
+    decision = "CONDITIONAL_APPROVAL"  # default
+    if "APPROVED" in content and "CONDITIONAL" not in content:
+        decision = "APPROVED"
+    elif "DENIED" in content:
+        decision = "DENIED"
+    elif "CONDITIONAL_APPROVAL" in content or "CONDITIONAL APPROVAL" in content:
+        decision = "CONDITIONAL_APPROVAL"
+
+    # Determine if human review needed (high risk or bias flags)
+    human_review_required = (
+        risk_score >= 65 or
+        len(state.get('bias_flags', [])) > 0 or
+        decision == "DENIED"
+    )
+
+    return {
+        **state,
+        "decision_memo": content,
+        "risk_score": risk_score,
+        "final_decision": decision,
+        "human_review_required": human_review_required,
+        "reasoning_chain": state.get("reasoning_chain", []) +
+            [f"Decision Agent: Final decision {decision} with risk score {risk_score}"]
+    }
+
+print("✅ Decision Agent created!")
